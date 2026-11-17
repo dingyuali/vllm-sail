@@ -111,20 +111,34 @@ def _probe_ready(port: int, expected_served_name: str) -> bool:
     return False
 
 
-def _stop_server(proc: subprocess.Popen[bytes] | None) -> None:
+def _stop_server(
+    proc: subprocess.Popen[bytes] | None, *, grace_s: float = 30.0
+) -> None:
+    """Stop vLLM server and all surviving workers in its process group."""
     if proc is None:
         return
+    # start_new_session=True sets pgid == proc.pid; workers may outlive the leader.
     pgid = proc.pid
-    for sig, wait_s in ((signal.SIGTERM, 30), (signal.SIGKILL, 10)):
-        try:
-            os.killpg(pgid, sig)
-        except (OSError, ProcessLookupError):
-            break
-        try:
-            proc.wait(timeout=wait_s)
-            break
-        except subprocess.TimeoutExpired:
-            continue
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except (OSError, ProcessLookupError):
+        pass
+
+    try:
+        proc.wait(timeout=grace_s)
+    except subprocess.TimeoutExpired:
+        pass
+
+    # Unconditionally SIGKILL the process group even if leader already exited.
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (OSError, ProcessLookupError):
+        pass
+
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def _wait_server_ready(
@@ -675,7 +689,7 @@ def run_model_sanity(
         reset_before_bench = _drain_and_reset_cache(port)
 
         # 4. Micro-perf bench (C=1, C=16) marked sanity_throughput_guard
-        bench_stage = stages["bench-micro"]
+        bench_stage = stages["bench"]
         bench_input = bench_stage["input"]
         bench_dir = results_dir / "bench"
         bench_dir.mkdir(parents=True, exist_ok=True)

@@ -975,6 +975,11 @@ def validate_policy_structure(
                 required={"stages"},
                 context=f"{context}.tiers.model_sanity",
             )
+            if not isinstance(ms["stages"], list):
+                raise ValidationError(
+                    f"{context}.tiers.model_sanity.stages must be a list"
+                )
+            seen_kinds: set[str] = set()
             for idx, stage in enumerate(ms["stages"]):
                 _check_keys(
                     stage,
@@ -999,6 +1004,16 @@ def validate_policy_structure(
                     required={"id", "kind", "cache"},
                     context=f"{context}.tiers.model_sanity.stages[{idx}]",
                 )
+                stage_kind = stage["kind"]
+                if stage_kind not in {"sanity", "evalscope", "bench"}:
+                    raise ValidationError(
+                        f"{context}.tiers.model_sanity.stages[{idx}]: invalid kind {stage_kind!r}"
+                    )
+                if stage_kind in seen_kinds:
+                    raise ValidationError(
+                        f"{context}.tiers.model_sanity: duplicate stage kind {stage_kind!r}"
+                    )
+                seen_kinds.add(stage_kind)
                 flags: list[str] = []
                 if recipe_path is not None:
                     resolved = resolve_recipe(
@@ -1013,6 +1028,10 @@ def validate_policy_structure(
                     resolved_flags=flags,
                     context=f"{context}.tiers.model_sanity.stages[{idx}]",
                 )
+                if stage.get("cache") != "enabled":
+                    raise ValidationError(
+                        f"{context}.tiers.model_sanity.stages[{idx}]: requires cache='enabled' for shared model_sanity server"
+                    )
                 dataset_ref = stage.get("dataset")
                 if dataset_ref is not None:
                     if not isinstance(dataset_ref, str) or "@" not in dataset_ref:
@@ -1040,6 +1059,11 @@ def validate_policy_structure(
                         raise ValidationError(
                             f"{context}: dataset {dataset_ref} version mismatch in {ds_path}"
                         )
+            missing_kinds = sorted({"sanity", "evalscope", "bench"} - seen_kinds)
+            if missing_kinds:
+                raise ValidationError(
+                    f"{context}.tiers.model_sanity: missing required stage kind(s): {', '.join(missing_kinds)}"
+                )
 
     for idx, stage in enumerate(policy.get("stages", [])):
         _validate_stage_cache_rules(

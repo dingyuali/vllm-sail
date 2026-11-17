@@ -277,6 +277,14 @@ def test_validate_policy_guardrails_and_redaction_gate(tmp_path: Path) -> None:
         "range_ratio must be in",
     )
     _check_bad_pol(
+        lambda d: d["tiers"]["model_sanity"]["stages"][2].update({"kind": "evalscope"}),
+        "duplicate stage kind",
+    )
+    _check_bad_pol(
+        lambda d: d["tiers"]["model_sanity"]["stages"].pop(),
+        "missing required stage kind",
+    )
+    _check_bad_pol(
         lambda d: d["tiers"]["model_sanity"]["stages"][1].update(
             {"dataset": "missing@2026-11"}
         ),
@@ -365,6 +373,149 @@ def test_runner_fast_sanity_falls_back_from_2l_to_full_layers(
         "bench_s": 0.0,
     }
     assert (tmp_path / "out" / "summary.json").is_file()
+
+
+def test_runner_model_sanity_end_to_end_with_checked_in_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exercise run_model_sanity against checked-in GLM-5.3 recipe/policy and golden."""
+    fake_proc = type("FakeProc", (), {"pid": 999999})()
+    monkeypatch.setenv("GSM8K_DATASET_PATH", str(tmp_path / "gsm8k_unused"))
+    monkeypatch.setattr(
+        ppu_recipe_runner, "_launch_resolved_server", lambda *a, **kw: fake_proc
+    )
+    monkeypatch.setattr(ppu_recipe_runner, "_stop_server", lambda *a, **kw: None)
+    monkeypatch.setattr(ppu_recipe_runner, "_wait_server_ready", lambda *a, **kw: 12.34)
+    monkeypatch.setattr(
+        ppu_recipe_runner,
+        "_send_chat_probe",
+        lambda **kw: {
+            "status": "pass",
+            "elapsed_s": 0.4,
+            "finish_reason": "stop",
+            "content_chars": 2,
+            "completion_tokens": 1,
+        },
+    )
+    monkeypatch.setattr(
+        ppu_recipe_runner,
+        "_drain_and_reset_cache",
+        lambda port: {"cache_reset_evidence": "endpoint_ack_only", "http_status": 200},
+    )
+
+    class _FakeEvalModule:
+        @staticmethod
+        def _ensure_launched_server_alive(*a, **kw):
+            return None
+
+        @staticmethod
+        def run_evalscope(
+            served_name, port, gsm8k_path, *, generation_config, limit, work_dir
+        ):
+            reviews_dir = Path(work_dir) / "reviews"
+            reviews_dir.mkdir(parents=True, exist_ok=True)
+            (reviews_dir / "gsm8k.json").write_text(
+                json.dumps([{"id": "q0", "score": 1.0}, {"id": "q1", "score": 0.0}]),
+                encoding="utf-8",
+            )
+            return {"score": 0.9689, "num": 1319}
+
+        @staticmethod
+        def extract_score(result):
+            return float(result["score"]), int(result["num"])
+
+    real_import = importlib.import_module
+
+    def fake_import(name: str):
+        if name == "scripts.eval.ppu_gsm8k_eval":
+            return _FakeEvalModule
+        return real_import(name)
+
+    monkeypatch.setattr(ppu_recipe_runner.importlib, "import_module", fake_import)
+
+    bench_calls: list[dict[str, object]] = []
+
+    def fake_bench(**kw):
+        bench_calls.append(kw)
+        return {
+            "request_throughput": 12.5,
+            "output_throughput": 420.0,
+            "mean_ttft_ms": 80.0,
+            "mean_tpot_ms": 15.0,
+        }
+
+    monkeypatch.setattr(ppu_recipe_runner, "_run_vllm_bench", fake_bench)
+
+    out_dir = tmp_path / "ms_out"
+    res = ppu_recipe_runner.run_model_sanity(
+        recipe_path=RECIPES_DIR / "zai-org" / "GLM-5.3.yaml",
+        policy_path=POLICY_DIR / "models" / "glm-5.3.yaml",
+        results_dir=out_dir,
+        parser_mode="skip",
+        queue_s=1.5,
+        post_ready_sleep=0,
+    )
+    assert res["status"] == "pass"
+    assert res["accuracy"]["score"] == 0.9689
+    assert res["accuracy"]["num"] == 1319
+    assert res["accuracy"]["within_band"] is True
+    assert res["accuracy"]["per_question"]["count"] == 2
+    assert set(res["bench"].keys()) == {"c1", "c16"}
+    assert [c["concurrency"] for c in bench_calls] == [1, 1, 16, 16]
+    assert [c["num_prompts"] for c in bench_calls] == [2, 8, 8, 32]
+    assert all(c["range_ratio"] == 0.0 for c in bench_calls)
+    assert res["timings"]["queue_s"] == 1.5
+    assert res["timings"]["cold_start_s"] == 12.34
+    assert (out_dir / "summary.json").is_file()
+    assert (out_dir / "gsm8k_per_question.jsonl").is_file()
+
+
+def test_stop_server_kills_outliving_process_group_worker(tmp_path: Path) -> None:
+    """Verify _stop_server SIGKILLs workers in the pgid even after the leader exits."""
+    import os
+    import time
+
+    pid_file = tmp_path / "worker.pid"
+    leader_code = (
+        "import os, pathlib, signal, subprocess, sys, time; "
+        "worker_code = 'import os, pathlib, signal, sys, time; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); "
+        "time.sleep(60)'; "
+        "w = subprocess.Popen([sys.executable, '-c', worker_code, sys.argv[1]]); "
+        "signal.signal(signal.SIGTERM, lambda *a: sys.exit(0)); "
+        "time.sleep(60)"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", leader_code, str(pid_file)],
+        start_new_session=True,
+    )
+    try:
+        deadline = time.monotonic() + 5.0
+        raw_pid = ""
+        while time.monotonic() < deadline:
+            if pid_file.exists():
+                raw_pid = pid_file.read_text(encoding="utf-8").strip()
+                if raw_pid:
+                    break
+            time.sleep(0.05)
+        assert raw_pid, "detached worker did not start"
+        worker_pid = int(raw_pid)
+
+        ppu_recipe_runner._stop_server(proc, grace_s=0.3)
+        assert proc.poll() is not None
+        kill_deadline = time.monotonic() + 2.0
+        while time.monotonic() < kill_deadline:
+            try:
+                os.kill(worker_pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail(f"worker {worker_pid} survived _stop_server")
+    finally:
+        if proc.poll() is None:
+            proc.kill()
 
 
 def test_recipe_workflows_follow_security_and_shell_contracts() -> None:
