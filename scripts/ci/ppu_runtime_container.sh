@@ -3,9 +3,9 @@
 # Run wheel validation in an isolated PPU runtime container.
 set -Eeuo pipefail
 
-mode=${1:?Usage: ppu_runtime_container.sh pin-ut|model-test|model-accuracy|kernel-perf|upstream-reuse}
+mode=${1:?Usage: ppu_runtime_container.sh pin-ut|model-test|model-accuracy|kernel-perf|upstream-reuse|recipe-sanity}
 case "${mode}" in
-    pin-ut|model-test|model-accuracy|kernel-perf|upstream-reuse) ;;
+    pin-ut|model-test|model-accuracy|kernel-perf|upstream-reuse|recipe-sanity) ;;
     *) printf 'Unknown runtime mode: %s\n' "${mode}" >&2; exit 2 ;;
 esac
 
@@ -323,6 +323,54 @@ case "${mode}" in
             --env VLLM_USE_RUST_BENCH=0
             --entrypoint bash "${image_id}"
             /source/scripts/ci/perf_regression.sh
+        )
+        ;;
+    recipe-sanity)
+        : "${PPU_CI_HF_HOME:?PPU_CI_HF_HOME is required for recipe-sanity}"
+        : "${PPU_CI_DG_CACHE_DIR:?PPU_CI_DG_CACHE_DIR is required for recipe-sanity}"
+        : "${MODEL_ID:?MODEL_ID is required for recipe-sanity}"
+        : "${RECIPE_PATH:?RECIPE_PATH is required for recipe-sanity}"
+        : "${POLICY_PATH:?POLICY_PATH is required for recipe-sanity}"
+        tier="${TIER:-fast_sanity}"
+        hf_home=$(realpath "${PPU_CI_HF_HOME}")
+        dg_cache_root=$(realpath "${PPU_CI_DG_CACHE_DIR}")
+        [[ -d "${hf_home}" ]] || { echo "PPU_CI_HF_HOME is not a directory" >&2; exit 2; }
+        [[ -d "${dg_cache_root}" ]] || { echo "PPU_CI_DG_CACHE_DIR is not a directory" >&2; exit 2; }
+        model_snapshot=$(resolve_snapshot "${MODEL_ID}")
+        create+=(
+            --shm-size=32g
+            --mount "type=bind,source=${hf_home},target=${hf_home},readonly"
+            --mount "type=bind,source=${dg_cache_root},target=${dg_cache_root}"
+            --env HF_HOME="${hf_home}"
+            --env HF_MODULES_CACHE="${hf_modules_cache}"
+            --env HF_HUB_OFFLINE=1
+            --env TRANSFORMERS_OFFLINE=1
+            --env DG_JIT_CACHE_DIR="${dg_cache_root}"
+            --env DG_CACHE_DIR="${dg_cache_root}"
+            --env MODEL_ID="${MODEL_ID}"
+            --env RECIPE_PATH="${RECIPE_PATH}"
+            --env POLICY_PATH="${POLICY_PATH}"
+            --env TIER="${tier}"
+            --env PRESET="${PRESET:-}"
+            --env LAYER_MODE="${LAYER_MODE:-auto}"
+            --env PPU_CI_QUEUE_S="${PPU_CI_QUEUE_S:-0}"
+            --env RESULTS_DIR=/artifacts
+            --env VLLM_PORT="${VLLM_PORT:-9985}"
+            --env VLLM_USE_RUST_FRONTEND=0
+            --env VLLM_USE_RUST_BENCH=0
+        )
+        if [[ -n "${GSM8K_DATASET_PATH:-}" ]]; then
+            gsm8k_dataset=$(realpath "${GSM8K_DATASET_PATH}")
+            [[ -d "${gsm8k_dataset}" ]] || { echo "GSM8K_DATASET_PATH is not a directory" >&2; exit 2; }
+            create+=(
+                --mount "type=bind,source=${gsm8k_dataset},target=${gsm8k_dataset},readonly"
+                --env GSM8K_DATASET_PATH="${gsm8k_dataset}"
+            )
+        fi
+        mount_snapshot_if_external "${model_snapshot}"
+        create+=(
+            --entrypoint bash "${image_id}"
+            /source/scripts/ci/ppu_e2e_recipe_sanity.sh
         )
         ;;
 esac

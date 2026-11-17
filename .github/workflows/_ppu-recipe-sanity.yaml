@@ -1,0 +1,186 @@
+name: PPU recipe sanity
+
+on:
+  workflow_call:
+    inputs:
+      pr_mode:
+        type: boolean
+        default: false
+      pr_head_sha:
+        type: string
+        default: ""
+      wheel_source_sha:
+        description: Validated SAIL source of the reused wheels
+        type: string
+        default: ""
+      build_run_id:
+        description: Run supplying the ppu-wheels artifact
+        required: true
+        type: string
+      tier:
+        description: Recipe validation tier (fast_sanity or model_sanity)
+        type: string
+        default: fast_sanity
+      models:
+        description: Comma-separated recipe policy slugs (blank = all)
+        type: string
+        default: ""
+      hf_home:
+        description: Host Hugging Face cache root
+        type: string
+        default: /nas_aisw/datasets/hf_cache
+      gsm8k_dataset_path:
+        description: Host GSM8K dataset directory
+        type: string
+        default: /nas_aisw/datasets/datasets/vision/EvalScope/data/gsm8k/v2/gsm8k
+      dg_cache_dir:
+        description: Host root for the DeepGEMM JIT kernel cache
+        type: string
+        default: /nas_aisw/vllmci_dgcache
+
+permissions:
+  contents: read
+  actions: read
+cache-mode: none
+
+concurrency:
+  group: recipe-sanity-${{ github.ref }}-${{ inputs.pr_mode && github.run_id || inputs.build_run_id }}-${{ inputs.tier }}-${{ inputs.models }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Resolve recipe matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.select.outputs.recipe_matrix }}
+      ready_epoch: ${{ steps.select.outputs.ready_epoch }}
+    steps:
+      - name: Require disabled cache access
+        uses: actions/github-script@v7
+        with:
+          script: |
+            if (process.env.ACTIONS_CACHE_MODE !== 'none') {
+              core.setFailed('PPU CI requires cache-mode: none');
+            }
+
+      - name: Check out vLLM SAIL
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || github.sha }}
+          persist-credentials: false
+
+      - name: Verify checked-out revision
+        env:
+          EXPECTED_SHA: ${{ inputs.pr_head_sha || github.sha }}
+        run: test "$(git -c safe.directory="$PWD" rev-parse HEAD)" = "$EXPECTED_SHA"
+
+      - name: Select recipe sanity models
+        id: select
+        env:
+          MODELS: ${{ inputs.models }}
+          TIER: ${{ inputs.tier }}
+        run: |
+          python3 scripts/ci/ppu_e2e_select.py --recipes "${MODELS}" "${TIER}" >> "$GITHUB_OUTPUT"
+          printf 'ready_epoch=%s\n' "$(date +%s)" >> "$GITHUB_OUTPUT"
+
+  sanity:
+    name: Recipe ${{ inputs.tier }} ${{ matrix.model.key }}
+    needs: prepare
+    runs-on: 8-ppu-m890p
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        model: ${{ fromJson(needs.prepare.outputs.matrix).include }}
+    env:
+      GIT_CONFIG_NOSYSTEM: "1"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Prepare private runtime directories and Git configuration
+        id: runtime
+        env:
+          READY_EPOCH: ${{ needs.prepare.outputs.ready_epoch }}
+        run: |
+          now_epoch="$(date +%s)"
+          queue_s=$(( now_epoch > READY_EPOCH ? now_epoch - READY_EPOCH : 0 ))
+          config="$(mktemp "${RUNNER_TEMP}/git-config.XXXXXX")"
+          wheels="$(mktemp -d "${RUNNER_TEMP}/ppu-recipe-wheels.XXXXXX")"
+          artifacts="$(mktemp -d "${RUNNER_TEMP}/ppu-recipe-artifacts.XXXXXX")"
+          source_rel=".ppu-recipe-source-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          source="${GITHUB_WORKSPACE}/${source_rel}"
+          {
+            printf 'GIT_CONFIG_GLOBAL=%s\n' "$config"
+            printf 'wheels=%s\n' "$wheels"
+            printf 'artifacts=%s\n' "$artifacts"
+            printf 'source_rel=%s\n' "$source_rel"
+            printf 'source=%s\n' "$source"
+            printf 'queue_s=%s\n' "$queue_s"
+          } >> "$GITHUB_OUTPUT"
+          printf 'GIT_CONFIG_GLOBAL=%s\n' "$config" >> "$GITHUB_ENV"
+
+      - name: Require disabled cache access
+        uses: actions/github-script@v7
+        with:
+          script: |
+            if (process.env.ACTIONS_CACHE_MODE !== 'none') {
+              core.setFailed('PPU CI requires cache-mode: none');
+            }
+
+      - name: Check out vLLM SAIL
+        uses: actions/checkout@v4
+        with:
+          github-server-url: https://github.com
+          ref: ${{ inputs.pr_head_sha || github.sha }}
+          path: ${{ steps.runtime.outputs.source_rel }}
+          persist-credentials: false
+
+      - name: Verify checked-out revision
+        env:
+          EXPECTED_SHA: ${{ inputs.pr_head_sha || github.sha }}
+          SOURCE_DIR: ${{ steps.runtime.outputs.source }}
+        run: test "$(git -c safe.directory="$SOURCE_DIR" -C "$SOURCE_DIR" rev-parse HEAD)" = "$EXPECTED_SHA"
+
+      - name: Download CI-built wheels
+        uses: actions/download-artifact@v4
+        with:
+          name: ppu-wheels-${{ inputs.build_run_id }}
+          path: ${{ steps.runtime.outputs.wheels }}
+          run-id: ${{ inputs.build_run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+
+      - name: Run recipe sanity in the PPU runtime container
+        env:
+          PPU_CI_SOURCE_DIR: ${{ steps.runtime.outputs.source }}
+          PPU_CI_SOURCE_SHA: ${{ inputs.pr_head_sha || github.sha }}
+          PPU_CI_WHEELS_DIR: ${{ steps.runtime.outputs.wheels }}
+          PPU_CI_ARTIFACT_DIR: ${{ steps.runtime.outputs.artifacts }}
+          PPU_CI_DEVICE_COUNT: ${{ matrix.model.ppu_count }}
+          PPU_CI_REQUIRE_PR_ARTIFACT: ${{ inputs.pr_mode }}
+          PPU_CI_WHEEL_SOURCE_SHA: ${{ inputs.wheel_source_sha || inputs.pr_head_sha || github.sha }}
+          PPU_CI_HF_HOME: ${{ inputs.hf_home }}
+          PPU_CI_DG_CACHE_DIR: ${{ inputs.dg_cache_dir }}
+          GSM8K_DATASET_PATH: ${{ inputs.gsm8k_dataset_path }}
+          MODEL_ID: ${{ matrix.model.model_id }}
+          RECIPE_PATH: ${{ matrix.model.recipe_path }}
+          POLICY_PATH: ${{ matrix.model.policy_path }}
+          TIER: ${{ inputs.tier }}
+          PPU_CI_QUEUE_S: ${{ steps.runtime.outputs.queue_s }}
+        run: bash "${PPU_CI_SOURCE_DIR}/scripts/ci/ppu_runtime_container.sh" recipe-sanity
+
+      - name: Upload sanitized recipe summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-recipe-${{ inputs.tier }}-${{ matrix.model.key }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ steps.runtime.outputs.artifacts }}/summary.json
+            ${{ steps.runtime.outputs.artifacts }}/gsm8k_per_question.jsonl
+            ${{ steps.runtime.outputs.artifacts }}/runtime-image-id.txt
+            ${{ steps.runtime.outputs.wheels }}/wheel-manifest.json
+          if-no-files-found: warn
+          retention-days: 14

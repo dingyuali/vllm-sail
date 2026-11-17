@@ -1,0 +1,53 @@
+name: PPU recipe sanity dispatch
+run-name: "PPU recipe ${{ inputs.tier }}: ${{ inputs.models || 'all' }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      tier:
+        description: Sanity tier (fast_sanity or model_sanity)
+        required: true
+        type: choice
+        options:
+          - fast_sanity
+          - model_sanity
+        default: fast_sanity
+      models:
+        description: Comma-separated recipe policy slugs (blank = all)
+        required: false
+        default: glm-5.3,deepseek-v4-flash
+        type: string
+      existing_build_run_id:
+        description: Optional existing ppu-wheels build run ID (blank builds from HEAD)
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+cache-mode: none
+
+jobs:
+  build:
+    name: Build PPU wheels
+    if: (inputs.existing_build_run_id || '') == ''
+    uses: ./.github/workflows/_ppu-build.yaml
+    with:
+      pr_head_sha: ${{ github.sha }}
+
+  recipe-sanity:
+    name: Recipe sanity
+    needs: build
+    if: always() && (needs.build.result == 'success' || (needs.build.result == 'skipped' && (inputs.existing_build_run_id || '') != ''))
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/_ppu-recipe-sanity.yaml
+    with:
+      pr_mode: false
+      pr_head_sha: ${{ github.sha }}
+      wheel_source_sha: ${{ (inputs.existing_build_run_id || '') == '' && github.sha || '' }}
+      build_run_id: ${{ inputs.existing_build_run_id || github.run_id }}
+      tier: ${{ inputs.tier }}
+      models: ${{ inputs.models }}
