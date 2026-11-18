@@ -190,6 +190,32 @@ jobs:
       build_run_id: ${{ inputs.existing_build_run_id || github.run_id }}
       wheel_source_sha: ${{ inputs.wheel_source_sha || '' }}
 
+  recipe-sanity:
+    name: PPU recipe fast sanity
+    needs: [runtime-image, build]
+    if: >-
+      ${{ !cancelled() &&
+      !inputs.skip_device_tests &&
+      needs.runtime-image.result == 'success' &&
+      (github.event_name != 'pull_request' ||
+      ((((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
+      github.event.label.name == 'ci-preview')) &&
+      !github.event.pull_request.draft &&
+      contains(github.event.pull_request.labels.*.name, 'ci-preview'))) &&
+      (needs.build.result == 'success' ||
+      (needs.build.result == 'skipped' &&
+      (inputs.existing_build_run_id || '') != '' &&
+      (inputs.wheel_source_sha || '') != '')) }}
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/_ppu-recipe-sanity.yaml
+    with:
+      pr_mode: true
+      pr_head_sha: ${{ inputs.pr_head_sha || github.sha }}
+      build_run_id: ${{ inputs.existing_build_run_id || github.run_id }}
+      wheel_source_sha: ${{ inputs.wheel_source_sha || '' }}
+
   upstream-reuse:
     name: PPU upstream reuse
     needs: [runtime-image, build]
@@ -219,7 +245,7 @@ jobs:
 
   gate:
     name: PPU CI gate
-    needs: [runtime-image, build, pin-unit-tests, model-tests, upstream-reuse]
+    needs: [runtime-image, build, pin-unit-tests, model-tests, recipe-sanity, upstream-reuse]
     if: >-
       ${{ always() &&
       (github.event_name != 'pull_request' ||
@@ -267,7 +293,7 @@ jobs:
               results["runtime-image"].get("outputs", {}).get("upstream_reuse")
               != "false"
           )
-          for job in ("pin-unit-tests", "model-tests", "upstream-reuse"):
+          for job in ("pin-unit-tests", "model-tests", "recipe-sanity", "upstream-reuse"):
               result = results.get(job, {}).get("result")
               if skip_device_tests and result == "skipped":
                   continue

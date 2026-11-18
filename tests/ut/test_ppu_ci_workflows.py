@@ -381,6 +381,7 @@ def test_pr_pipeline_structure():
         "build",
         "pin-unit-tests",
         "model-tests",
+        "recipe-sanity",
         "upstream-reuse",
         "gate",
     }
@@ -411,6 +412,7 @@ def test_pr_pipeline_structure():
         "build",
         "pin-unit-tests",
         "model-tests",
+        "recipe-sanity",
         "upstream-reuse",
     ]
     assert "always()" in jobs["gate"]["if"]
@@ -428,6 +430,7 @@ def test_pr_pipeline_structure():
     for job_id, name, target in (
         ("pin-unit-tests", "PPU pin UT", "_ppu-pin-ut.yaml"),
         ("model-tests", "PPU model tests", "_ppu-model-tests.yaml"),
+        ("recipe-sanity", "PPU recipe fast sanity", "_ppu-recipe-sanity.yaml"),
         ("upstream-reuse", "PPU upstream reuse", "_ppu-upstream-reuse.yaml"),
     ):
         job = jobs[job_id]
@@ -462,6 +465,7 @@ def test_docs_only_call_uses_hosted_gate_without_ppu_jobs():
         "build",
         "pin-unit-tests",
         "model-tests",
+        "recipe-sanity",
         "upstream-reuse",
     ):
         assert not expression(jobs[job_id]["if"], context)
@@ -481,6 +485,7 @@ def test_docs_only_call_uses_hosted_gate_without_ppu_jobs():
                         "build",
                         "pin-unit-tests",
                         "model-tests",
+                        "recipe-sanity",
                         "upstream-reuse",
                     )
                 }
@@ -510,7 +515,7 @@ def test_skip_device_tests_guards_the_device_lanes():
     }
     # Building wheels for a lane that tests elsewhere must not also allocate
     # the pin-UT and model-smoke hosts.
-    for job_id in ("pin-unit-tests", "model-tests", "upstream-reuse"):
+    for job_id in ("pin-unit-tests", "model-tests", "recipe-sanity", "upstream-reuse"):
         assert not expression(jobs[job_id]["if"], context)
     assert expression(jobs["build"]["if"], context)
     assert expression(jobs["gate"]["if"], context)
@@ -530,6 +535,7 @@ def test_gate_honours_skip_device_tests(skip_device_tests, returncode):
                 "build": {"result": "success"},
                 "pin-unit-tests": {"result": "skipped"},
                 "model-tests": {"result": "skipped"},
+                "recipe-sanity": {"result": "skipped"},
                 "upstream-reuse": {"result": "skipped"},
             }
         ),
@@ -892,6 +898,7 @@ def test_removing_ci_preview_cancels_active_preview_without_starting_jobs():
         ("build", "_ppu-build.yaml", ["build"]),
         ("pin-unit-tests", "_ppu-pin-ut.yaml", ["pin-unit-tests"]),
         ("model-tests", "_ppu-model-tests.yaml", ["prepare", "e2e"]),
+        ("recipe-sanity", "_ppu-recipe-sanity.yaml", ["prepare", "sanity"]),
         ("upstream-reuse", "_ppu-upstream-reuse.yaml", ["upstream-reuse"]),
     ],
 )
@@ -1229,7 +1236,7 @@ def test_consumers_require_build_or_valid_reuse(build_jobs, build, run_id, sourc
     }
     reuse = bool(run_id) and bool(source)
     eligible = build == "success" or (build == "skipped" and reuse)
-    for job_id in ("pin-unit-tests", "model-tests", "upstream-reuse"):
+    for job_id in ("pin-unit-tests", "model-tests", "recipe-sanity", "upstream-reuse"):
         assert bool(expression(build_jobs[job_id]["if"], context)) == eligible
     assert bool(expression(build_jobs["build"]["if"], context)) == (not run_id)
     # Gate must execute even after failed/cancelled/skipped dependencies.
@@ -1238,7 +1245,7 @@ def test_consumers_require_build_or_valid_reuse(build_jobs, build, run_id, sourc
 
 @pytest.mark.parametrize(
     "states",
-    itertools.product(["success", "failure", "cancelled", "skipped"], repeat=4),
+    itertools.product(["success", "failure", "cancelled", "skipped"], repeat=5),
 )
 @pytest.mark.parametrize(
     "run_id,source", [("", ""), ("123", "a" * 40), ("999", ""), ("", "a" * 40)]
@@ -1262,7 +1269,7 @@ def test_gate_executes_fail_closed_truth_table(
     results = {"runtime-image": {"result": "success"}}
     results.update(
         zip(
-            ("build", "pin-unit-tests", "model-tests", "upstream-reuse"),
+            ("build", "pin-unit-tests", "model-tests", "recipe-sanity", "upstream-reuse"),
             ({"result": state} for state in states),
             strict=False,
         )
@@ -1278,7 +1285,7 @@ def test_gate_executes_fail_closed_truth_table(
     expected = (
         states[0] == "success"
         or (states[0] == "skipped" and bool(run_id) and bool(source))
-    ) and states[1:] == ("success", "success", "success")
+    ) and states[1:] == ("success", "success", "success", "success")
     assert passed is expected
 
 
@@ -1347,6 +1354,7 @@ def test_gate_accepts_skipped_reuse_only_without_the_entry_script(
     results = {
         "runtime-image": {"result": "success", "outputs": outputs},
         "build": {"result": "success"},
+        "recipe-sanity": {"result": "success"},
     }
     results.update(
         (job, {"result": state})
