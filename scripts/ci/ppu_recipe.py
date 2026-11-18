@@ -897,7 +897,7 @@ def _validate_stage_cache_rules(
             ratio = bench_input["range_ratio"]
             if (
                 isinstance(ratio, bool)
-                or not isinstance(ratio, (int, float))
+                or not isinstance(ratio, int | float)
                 or not (0.0 <= float(ratio) < 1.0)
             ):
                 raise ValidationError(
@@ -947,7 +947,7 @@ def validate_policy_structure(
     if tiers:
         _check_keys(
             tiers,
-            allowed={"fast_sanity", "model_sanity", "trm_nightly", "release"},
+            allowed={"fast_sanity", "model_sanity", "nightly", "release"},
             context=f"{context}.tiers",
         )
         if "fast_sanity" in tiers:
