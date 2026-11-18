@@ -67,7 +67,8 @@ def failure_reason(source: Path, tier: str) -> str:
                     "mla_indexer.py" in server
                     and re.search(r"schedul(?:e|er)_metadata", server)
                     and re.search(
-                        r"(?:tensor a \(2\).*tensor b \(4\)|tensor a \(4\).*tensor b \(2\))"
+                        r"(?:tensor a \(2\).*tensor b \(4\)|tensor a \(4\).*tensor b \(2\)"
+                        r"|expanded size of the tensor \(2\).*existing size \(4\))"
                         r" at non-singleton dimension 1",
                         server,
                     )

@@ -1887,14 +1887,27 @@ def test_recipe_retention_and_publication(
 
 
 @pytest.mark.parametrize(
-    "tier,server_label,reason",
+    "tier,server_label,error,reason",
     [
-        ("fast_sanity", None, "runtime_setup_failed"),
-        ("model_sanity", "model_sanity", "mla_metadata_shape_mismatch"),
+        ("fast_sanity", None, None, "runtime_setup_failed"),
+        (
+            "model_sanity",
+            "model_sanity",
+            "The size of tensor a (2) must match the size of tensor b (4)"
+            " at non-singleton dimension 1",
+            "mla_metadata_shape_mismatch",
+        ),
+        (
+            "model_sanity",
+            "model_sanity",
+            "The expanded size of the tensor (2) must match the existing size (4)"
+            " at non-singleton dimension 1. Target sizes: [313, 2]. Tensor sizes: [630, 4]",
+            "mla_metadata_shape_mismatch",
+        ),
     ],
 )
 def test_failed_recipe_retains_logs_without_summary(
-    tmp_path, tier, server_label, reason
+    tmp_path, tier, server_label, error, reason
 ):
     leaf = f"_ppu-recipe-{tier.replace('_', '-')}.yaml"
     steps = workflow(leaf)["jobs"]["sanity"]["steps"]
@@ -1912,8 +1925,7 @@ def test_failed_recipe_retains_logs_without_summary(
         logs[f"results/vllm_serve_{server_label}.log"] = (
             f'File "{retention_root}/mla_indexer.py", line 315\n'
             "    self.scheduler_metadata_buffer.copy_(schedule_metadata)\n"
-            "RuntimeError: The size of tensor a (2) must match the size of tensor b (4)"
-            " at non-singleton dimension 1\n"
+            f"RuntimeError: {error}\n"
         )
     for name, content in logs.items():
         (private_dir / name).write_text(content)
