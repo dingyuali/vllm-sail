@@ -105,6 +105,25 @@ issue and fails the job. Installation failure stops before that report step.
 This scheduled check does not replace PR checks, and none of these public CPU
 jobs runs PPU inference or `tests/e2e`.
 
+### Recipe sanity results
+
+The PR recipe job runs `fast_sanity`. The registered accuracy nightly runs
+`model_sanity` (including GSM8K and micro-E2E). The runner administrator must
+set `PPU_CI_PRIVATE_RESULTS_ROOT` in the runner service environment on every
+eligible runner to retain private results after the runtime container exits.
+Provision a persistent, runner-writable directory outside the job workspace and
+temporary storage, with mode `0700` and access restricted to the trusted runner
+service identity. Retained directories and files use modes `0700` and `0600`.
+Set an operator-managed cleanup policy based on the baseline comparison window
+and available space; remove expired run attempts and abandoned staging directories
+only when no writer is active.
+
+The public console, step summary, and artifact expose only the recipe outcome
+and a retention status (`retained`, `not_configured`, or `failed`). An unset
+variable warns in `fast_sanity` and fails `model_sanity`; a configured copy
+failure fails either job. `retained` confirms the private files were saved, not
+that the run established a complete or comparable GSM8K baseline.
+
 ### Upstream test reuse
 
 Upstream reuse runs on a single M890 card in the authorized PPU pipeline, not

@@ -348,7 +348,7 @@ def _extract_per_question_evalscope(
         source_reasons.append(f"评分文件数量不符：预期 1，实际 {len(candidates)}")
     else:
         try:
-            lines = source.read_text(encoding="utf-8").splitlines()
+            lines = source.read_text(encoding="utf-8").split("\n")
         except (OSError, UnicodeError):
             lines = []
             source_reasons.append("评分文件读取失败")

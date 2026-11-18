@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
+import hashlib
 import itertools
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import types
@@ -1599,20 +1601,34 @@ def test_recipe_workflow_refuses_arbitrary_wheel_run(
 
 
 @pytest.mark.parametrize(
-    "leaf_name",
-    ["_ppu-recipe-fast-sanity.yaml", "_ppu-recipe-model-sanity.yaml"],
+    "leaf_name,tier",
+    [
+        ("_ppu-recipe-fast-sanity.yaml", "fast_sanity"),
+        ("_ppu-recipe-model-sanity.yaml", "model_sanity"),
+    ],
 )
 @pytest.mark.parametrize("exit_code,status", [(0, "pass"), (3, "fail")])
-def test_recipe_publication_excludes_raw_launcher_logs_and_results(
-    tmp_path, leaf_name, exit_code, status
+@pytest.mark.parametrize(
+    "retention_case",
+    ["configured", "unset", "copy_error", "retry", "unsafe_source", "ephemeral"],
+)
+def test_recipe_retention_and_status_only_publication(
+    tmp_path, leaf_name, tier, exit_code, status, retention_case
 ):
     steps = workflow(leaf_name)["jobs"]["sanity"]["steps"]
     runtime = next(step for step in steps if step.get("id") == "recipe")
+    retain = next(step for step in steps if step.get("id") == "retain")
     publish = next(step for step in steps if step.get("id") == "publish")
     upload = next(
         step for step in steps if step.get("uses") == "actions/upload-artifact@v4"
     )
     assert upload["with"]["path"] == "${{ steps.runtime.outputs.public }}/summary.json"
+    assert steps.index(runtime) < steps.index(retain) < steps.index(publish)
+    assert retain["if"] == "always() && steps.runtime.outcome == 'success'"
+    assert retain["env"]["TIER"] == tier
+    assert all(
+        "PPU_CI_PRIVATE_RESULTS_ROOT" not in step.get("env", {}) for step in steps
+    )
     assert (
         not {"PPU_CI_HF_HOME", "GSM8K_DATASET_PATH", "PPU_CI_DG_CACHE_DIR"}
         & runtime["env"].keys()
@@ -1622,12 +1638,29 @@ def test_recipe_publication_excludes_raw_launcher_logs_and_results(
     launcher_path.parent.mkdir(parents=True)
     launcher_path.write_text(
         'echo "synthetic-private-stdout"\necho "synthetic-private-stderr" >&2\n'
-        'printf \'{"throughput":123,"path":"/private/model"}\' > "$PPU_CI_ARTIFACT_DIR/summary.json"\n'
+        'printf \'{"throughput":123,"path":"%s"}\' "$FAKE_SENSITIVE_ROOT" '
+        '> "$PPU_CI_ARTIFACT_DIR/summary.json"\n'
         f"exit {exit_code}\n"
     )
     private_dir, public_dir = tmp_path / "private", tmp_path / "public"
     private_dir.mkdir()
     public_dir.mkdir()
+    runner_temp = tmp_path / "runner-temp"
+    retention_root = (
+        runner_temp if retention_case == "ephemeral" else tmp_path
+    ) / "mock-intranet-retention"
+    retention_root.mkdir(parents=True, mode=0o700)
+    attempt_dir = retention_root / "vllm-sail" / "101-2" / tier
+    retained_dir = attempt_dir / "glm-5.3"
+    if retention_case == "retry":
+        for directory in (
+            retention_root / "vllm-sail",
+            attempt_dir.parent,
+            attempt_dir,
+            retained_dir,
+        ):
+            directory.mkdir(mode=0o700)
+        (retained_dir / "index.json").write_text("original index")
     job_summary = tmp_path / "job-summary.md"
     launch_result = subprocess.run(
         ["bash", "-e", "-c", runtime["run"]],
@@ -1635,6 +1668,7 @@ def test_recipe_publication_excludes_raw_launcher_logs_and_results(
             **os.environ,
             "PPU_CI_SOURCE_DIR": str(tmp_path),
             "PPU_CI_ARTIFACT_DIR": str(private_dir),
+            "FAKE_SENSITIVE_ROOT": str(retention_root),
         },
         capture_output=True,
         text=True,
@@ -1645,11 +1679,91 @@ def test_recipe_publication_excludes_raw_launcher_logs_and_results(
         "synthetic-private-stdout",
         "synthetic-private-stderr",
     ]
+    if retention_case == "unsafe_source":
+        (private_dir / "provenance.json").symlink_to(private_dir / "summary.json")
+    elif retention_case != "copy_error":
+        (private_dir / "provenance.json").write_text("private provenance")
+    filenames = {"summary.json", "provenance.json", "launcher.log"}
+    if tier == "model_sanity":
+        filenames.add("gsm8k_per_question.jsonl")
+        (private_dir / "gsm8k_per_question.jsonl").write_text("private scores")
+    (private_dir / "runtime.log").write_text("not on the retention allowlist")
+    outputs = tmp_path / "retention-output"
+    retain_result = subprocess.run(
+        ["bash", "-e", "-c", retain["run"]],
+        env={
+            **os.environ,
+            "PPU_CI_SOURCE_DIR": str(ROOT),
+            "PPU_CI_SOURCE_SHA": "a" * 40,
+            "PPU_CI_ARTIFACT_DIR": str(private_dir),
+            "PPU_CI_PRIVATE_RESULTS_ROOT": (
+                "" if retention_case == "unset" else str(retention_root)
+            ),
+            "TIER": tier,
+            "MODEL_KEY": "glm-5.3",
+            "RUNNER_TEMP": str(runner_temp),
+            "GITHUB_WORKSPACE": str(tmp_path / "workspace"),
+            "GITHUB_RUN_ID": "101",
+            "GITHUB_RUN_ATTEMPT": "2",
+            "GITHUB_OUTPUT": str(outputs),
+        },
+        capture_output=True,
+        text=True,
+    )
+    expected_retention = {"configured": "retained", "unset": "not_configured"}.get(
+        retention_case, "failed"
+    )
+    retention = outputs.read_text().removeprefix("retention=").strip()
+    assert retention == expected_retention
+    expected_error = not (
+        retention_case == "configured"
+        or (retention_case == "unset" and tier == "fast_sanity")
+    )
+    assert retain_result.returncode == int(expected_error)
+    assert retain_result.stderr == ""
+    if retention_case == "configured":
+        assert {file.name for file in retained_dir.iterdir()} == filenames | {
+            "index.json"
+        }
+        assert json.loads((retained_dir / "index.json").read_text()) == {
+            "checkout_sha": "a" * 40,
+            "tier": tier,
+            "model_key": "glm-5.3",
+            "run_id": "101",
+            "attempt": "2",
+            "files": {
+                name: hashlib.sha256((private_dir / name).read_bytes()).hexdigest()
+                for name in filenames
+            },
+        }
+        for entry in retention_root.rglob("*"):
+            assert stat.S_IMODE(entry.stat().st_mode) == (
+                0o700 if entry.is_dir() else 0o600
+            )
+        for name in filenames:
+            assert (retained_dir / name).read_bytes() == (
+                private_dir / name
+            ).read_bytes()
+    elif retention_case == "retry":
+        assert (retained_dir / "index.json").read_text() == "original index"
+    else:
+        assert not retained_dir.exists()
+    assert not list(retention_root.rglob(".staging-*"))
+    if retention_case == "unset":
+        sev = "error" if expected_error else "warning"
+        assert retain_result.stdout == (
+            f"::{sev}::private results retention not configured\n"
+        )
+    else:
+        assert retain_result.stdout == ""
+
     publish_result = subprocess.run(
         ["bash", "-e", "-c", publish["run"]],
         env={
             **os.environ,
             "RECIPE_OUTCOME": "failure" if exit_code else "success",
+            "RETENTION_OUTCOME": "failure" if retain_result.returncode else "success",
+            "RETENTION": retention,
             "PUBLIC_DIR": str(public_dir),
             "GITHUB_STEP_SUMMARY": str(job_summary),
         },
@@ -1657,10 +1771,20 @@ def test_recipe_publication_excludes_raw_launcher_logs_and_results(
         text=True,
         check=True,
     )
-    assert publish_result.stdout == f"Recipe sanity: {status}\n"
+    if expected_error:
+        status = "fail"
+    public_summary = (public_dir / "summary.json").read_text()
+    assert publish_result.stdout == f"Recipe sanity: {status}\nretention: {retention}\n"
     assert not publish_result.stderr
-    assert job_summary.read_text() == f"Recipe sanity: {status}\n"
-    assert json.loads((public_dir / "summary.json").read_text()) == {"status": status}
+    assert job_summary.read_text() == publish_result.stdout
+    assert json.loads(public_summary) == {"status": status, "retention": retention}
+    for public_output in (
+        retain_result.stdout + retain_result.stderr + publish_result.stdout,
+        job_summary.read_text(),
+        public_summary,
+    ):
+        assert str(retention_root) not in public_output
+        assert "mock-intranet-retention" not in public_output
 
 
 def test_runtime_workflows_use_the_checked_in_docker_wrapper():

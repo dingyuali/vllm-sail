@@ -566,11 +566,21 @@ def test_recipe_workflows_follow_security_and_shell_contracts() -> None:
     fast_wf = yaml.safe_load(
         (ROOT / ".github" / "workflows" / "_ppu-recipe-fast-sanity.yaml").read_text()
     )
-    assert fast_wf["jobs"]["sanity"]["steps"][-3]["env"]["TIER"] == "fast_sanity"
+    fast_recipe = next(
+        step
+        for step in fast_wf["jobs"]["sanity"]["steps"]
+        if step.get("id") == "recipe"
+    )
+    assert fast_recipe["env"]["TIER"] == "fast_sanity"
     model_wf = yaml.safe_load(
         (ROOT / ".github" / "workflows" / "_ppu-recipe-model-sanity.yaml").read_text()
     )
-    assert model_wf["jobs"]["sanity"]["steps"][-3]["env"]["TIER"] == "model_sanity"
+    model_recipe = next(
+        step
+        for step in model_wf["jobs"]["sanity"]["steps"]
+        if step.get("id") == "recipe"
+    )
+    assert model_recipe["env"]["TIER"] == "model_sanity"
     pr_wf = yaml.safe_load(
         (ROOT / ".github" / "workflows" / "ppu-build-and-test.yaml").read_text()
     )
@@ -618,7 +628,10 @@ def _review_fixture(run: str = "a") -> list[dict]:
 def _write_review(root: Path, rows: list[dict], model: str = "fixture") -> Path:
     path = root / "20261118_102334" / "reviews" / model / "gsm8k_main.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    path.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+        encoding="utf-8",
+    )
     return path
 
 
@@ -641,6 +654,23 @@ def _extract_review(root: Path) -> tuple[dict, list[dict]]:
     )
     records = [json.loads(line) for line in output.read_text().splitlines()]
     return result, records
+
+
+@pytest.mark.parametrize("generation", ["plain answer", "answer\u2028step\u0085result"])
+def test_extract_review_uses_only_jsonl_newlines(
+    tmp_path: Path, generation: str
+) -> None:
+    rows = _review_fixture()
+    rows[0]["prediction"] = {"content": generation}
+    source = _write_review(tmp_path, rows)
+    assert generation in source.read_text(encoding="utf-8")
+
+    result, records = _extract_review(tmp_path)
+
+    assert result["status"] == "baseline_established"
+    assert result["count"] == result["unique_ids"] == len(rows)
+    assert result["unscored"] == 0
+    assert records[0] == {"question_id": "6", "correct": True, "score": 1.0}
 
 
 @pytest.mark.parametrize("prediction_first", [False, True])

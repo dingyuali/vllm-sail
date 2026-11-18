@@ -167,22 +167,40 @@ jobs:
           bash "${PPU_CI_SOURCE_DIR}/scripts/ci/ppu_runtime_container.sh" recipe-sanity \
             >"${PPU_CI_ARTIFACT_DIR}/launcher.log" 2>&1
 
+      - name: Retain private recipe results on the runner
+        id: retain
+        if: always() && steps.runtime.outcome == 'success'
+        env:
+          PPU_CI_SOURCE_DIR: ${{ steps.runtime.outputs.source }}
+          PPU_CI_SOURCE_SHA: ${{ inputs.pr_head_sha || github.sha }}
+          PPU_CI_ARTIFACT_DIR: ${{ steps.runtime.outputs.artifacts }}
+          TIER: fast_sanity
+          MODEL_KEY: ${{ matrix.model.key }}
+        run: |
+          umask 077
+          python3 -I "${PPU_CI_SOURCE_DIR}/scripts/ci/ppu_recipe_retention.py"
+
       - name: Publish recipe sanity status
         id: publish
         if: always() && steps.runtime.outcome == 'success'
         env:
           RECIPE_OUTCOME: ${{ steps.recipe.outcome }}
+          RETENTION_OUTCOME: ${{ steps.retain.outcome }}
+          RETENTION: ${{ steps.retain.outputs.retention }}
           PUBLIC_DIR: ${{ steps.runtime.outputs.public }}
         run: |
           case "$RECIPE_OUTCOME" in
-            success) status=pass ;;
+            success) if [[ "$RETENTION_OUTCOME" == success ]]; then status=pass; else status=fail; fi ;;
             failure) status=fail ;;
             cancelled) status=cancelled ;;
             *) status=not_run ;;
           esac
-          printf 'Recipe sanity: %s\n' "$status"
-          printf 'Recipe sanity: %s\n' "$status" >> "$GITHUB_STEP_SUMMARY"
-          printf '{"status":"%s"}\n' "$status" > "$PUBLIC_DIR/summary.json"
+          case "$RETENTION" in
+            retained|not_configured|failed) retention="$RETENTION" ;;
+            *) retention=failed ;;
+          esac
+          printf 'Recipe sanity: %s\nretention: %s\n' "$status" "$retention" | tee -a "$GITHUB_STEP_SUMMARY"
+          printf '{"status":"%s","retention":"%s"}\n' "$status" "$retention" > "$PUBLIC_DIR/summary.json"
 
       - name: Upload recipe sanity status
         if: always() && steps.publish.outcome == 'success'
