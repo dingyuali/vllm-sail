@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import importlib.metadata
 import json
+import math
 import os
 import re
 import secrets
@@ -275,78 +277,156 @@ def _drain_and_reset_cache(port: int, *, timeout: int = 120) -> dict[str, Any]:
     return {"cache_reset_evidence": "endpoint_ack_only", "http_status": 200}
 
 
+def assess_per_question_baseline(
+    records: list[dict[str, Any]],
+    *,
+    expected_count: int,
+    aggregate_score: float,
+    aggregate_num: int,
+    unscored: int = 0,
+) -> dict[str, Any]:
+    count = len(records)
+    ids = [
+        str(item["question_id"])
+        for item in records
+        if isinstance(item["question_id"], str | int)
+        and not isinstance(item["question_id"], bool)
+        and str(item["question_id"]).strip()
+    ]
+    unique_ids = len(set(ids))
+    unscored += sum(not isinstance(item["correct"], bool) for item in records)
+    correct_sum = sum(item["correct"] is True for item in records)
+    reasons = []
+    if len(ids) != count:
+        reasons.append("缺少稳定题目 ID")
+    if unique_ids != len(ids):
+        reasons.append("重复 ID")
+    if count != expected_count:
+        reasons.append(f"数量不符：预期 {expected_count}，实际 {count}")
+    if unscored:
+        reasons.append(f"存在未评分题：{unscored}")
+    if (
+        not count
+        or aggregate_num != count
+        or not math.isfinite(aggregate_score)
+        or not 0.0 <= aggregate_score <= 1.0
+        or correct_sum != round(aggregate_score * aggregate_num)
+        or abs(correct_sum / count - aggregate_score) > 1 / count
+    ):
+        reasons.append("与汇总不一致")
+    return {
+        "status": "baseline_incomplete" if reasons else "baseline_established",
+        "reasons": reasons,
+        "count": count,
+        "unique_ids": unique_ids,
+        "unscored": unscored,
+        "correct_sum": correct_sum,
+    }
+
+
 def _extract_per_question_evalscope(
     eval_work_dir: Path,
     output_jsonl: Path,
+    *,
+    expected_count: int,
+    aggregate_score: float,
+    aggregate_num: int,
+    dataset: str = "gsm8k",
+    subset: str = "main",
 ) -> dict[str, Any]:
-    """Extract sanitized per-question GSM8K records for future paired McNemar comparison."""
     records: list[dict[str, Any]] = []
+    unscored = 0
+    missing_ids = 0
+    source_reasons = []
     candidates = sorted(
-        list(eval_work_dir.rglob("*.jsonl"))
-        + list(eval_work_dir.rglob("reviews/**/*.json"))
+        path
+        for path in eval_work_dir.rglob(f"{dataset}_{subset}.jsonl")
+        if path.parent.parent.name == "reviews"
     )
-    for path in candidates:
-        text = path.read_text(encoding="utf-8", errors="replace").strip()
-        if not text:
-            continue
-        if path.suffix == ".jsonl":
-            rows = []
-            for line in text.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rows.append(json.loads(line))
-                except ValueError:
-                    continue
-        else:
+    source = candidates[0] if len(candidates) == 1 else None
+    if source is None:
+        source_reasons.append(f"评分文件数量不符：预期 1，实际 {len(candidates)}")
+    else:
+        try:
+            lines = source.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeError):
+            lines = []
+            source_reasons.append("评分文件读取失败")
+        for line in lines:
+            if not line.strip():
+                continue
             try:
-                loaded = json.loads(text)
+                row = json.loads(line)
             except ValueError:
+                unscored += 1
                 continue
-            rows = loaded if isinstance(loaded, list) else []
-        for idx, row in enumerate(rows):
-            if not isinstance(row, dict):
-                continue
-            if not any(
-                k in row
-                for k in (
-                    "score",
-                    "is_correct",
-                    "correct",
-                    "sample_score",
-                    "pred",
-                    "prediction",
-                )
+            sample_score = row.get("sample_score") if isinstance(row, dict) else None
+            score = (
+                sample_score.get("score") if isinstance(sample_score, dict) else None
+            )
+            if (
+                not isinstance(score, dict)
+                or score.get("status") != "success"
+                or score.get("main_score_name") not in {None, "accuracy", "acc"}
             ):
+                unscored += 1
                 continue
-            raw_score = row.get("score")
-            if raw_score is None and isinstance(row.get("sample_score"), dict):
-                sc = row["sample_score"].get("score")
-                raw_score = sc.get("value") if isinstance(sc, dict) else sc
-            correct = row.get("is_correct")
-            if correct is None:
-                correct = row.get("correct")
-            if correct is None and isinstance(raw_score, (int, float)):
-                correct = bool(float(raw_score) > 0.5)
+            value = score.get("value")
+            if isinstance(value, dict):
+                value = value.get("accuracy", value.get("acc"))
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int | float)
+                or value not in (0.0, 1.0)
+            ):
+                unscored += 1
+                continue
+            question_id = sample_score.get("sample_id")
+            if question_id is None:
+                question_id = row.get("index")
+            if (
+                isinstance(question_id, bool)
+                or not isinstance(question_id, str | int)
+                or not str(question_id).strip()
+            ):
+                missing_ids += 1
+                continue
             records.append(
                 {
-                    "index": row.get("index", idx),
-                    "question_id": str(row.get("id", row.get("question_id", idx))),
-                    "correct": bool(correct) if correct is not None else None,
-                    "score": float(raw_score)
-                    if isinstance(raw_score, (int, float))
-                    else None,
+                    "question_id": str(question_id),
+                    "correct": value == 1.0,
+                    "score": float(value),
                 }
             )
-        if records:
-            break
 
     output_jsonl.parent.mkdir(parents=True, exist_ok=True)
     with output_jsonl.open("w", encoding="utf-8") as fh:
         for item in records:
             fh.write(json.dumps(item, ensure_ascii=False) + "\n")
-    return {"count": len(records), "path": output_jsonl.name}
+    baseline = assess_per_question_baseline(
+        records,
+        expected_count=expected_count,
+        aggregate_score=aggregate_score,
+        aggregate_num=aggregate_num,
+        unscored=unscored,
+    )
+    if missing_ids:
+        source_reasons.append(f"缺少稳定题目 ID：{missing_ids}")
+    if source_reasons:
+        baseline["status"] = "baseline_incomplete"
+        baseline["reasons"].extend(source_reasons)
+    try:
+        evalscope_version = importlib.metadata.version("evalscope")
+    except importlib.metadata.PackageNotFoundError:
+        evalscope_version = "unknown"
+    return {
+        **baseline,
+        "path": output_jsonl.name,
+        "source_file": str(source.relative_to(eval_work_dir)) if source else None,
+        "evalscope_version": evalscope_version,
+        "dataset": dataset,
+        "subset": subset,
+    }
 
 
 def _launch_resolved_server(
@@ -665,7 +745,13 @@ def run_model_sanity(
         eval_s = round(time.monotonic() - eval_t0, 3)
 
         per_q_info = _extract_per_question_evalscope(
-            eval_work_dir, results_dir / "gsm8k_per_question.jsonl"
+            eval_work_dir,
+            results_dir / "gsm8k_per_question.jsonl",
+            expected_count=dataset_spec["num_expected"],
+            aggregate_score=score,
+            aggregate_num=num,
+            dataset=dataset_spec["id"],
+            subset=dataset_spec["subset_list"][0],
         )
 
         golden_file = (

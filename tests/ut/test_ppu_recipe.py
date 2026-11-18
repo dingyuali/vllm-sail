@@ -375,8 +375,9 @@ def test_runner_fast_sanity_falls_back_from_2l_to_full_layers(
     assert (tmp_path / "out" / "summary.json").is_file()
 
 
+@pytest.mark.parametrize(("score", "status"), [(0.9689, "pass"), (0.9, "fail")])
 def test_runner_model_sanity_end_to_end_with_checked_in_policy(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, score: float, status: str
 ) -> None:
     """Exercise run_model_sanity against checked-in GLM-5.3 recipe/policy and golden."""
     fake_proc = type("FakeProc", (), {"pid": 999999})()
@@ -412,13 +413,8 @@ def test_runner_model_sanity_end_to_end_with_checked_in_policy(
         def run_evalscope(
             served_name, port, gsm8k_path, *, generation_config, limit, work_dir
         ):
-            reviews_dir = Path(work_dir) / "reviews"
-            reviews_dir.mkdir(parents=True, exist_ok=True)
-            (reviews_dir / "gsm8k.json").write_text(
-                json.dumps([{"id": "q0", "score": 1.0}, {"id": "q1", "score": 0.0}]),
-                encoding="utf-8",
-            )
-            return {"score": 0.9689, "num": 1319}
+            _write_review(Path(work_dir), _review_fixture()[:2], model=served_name)
+            return {"score": score, "num": 1319}
 
         @staticmethod
         def extract_score(result):
@@ -455,11 +451,12 @@ def test_runner_model_sanity_end_to_end_with_checked_in_policy(
         queue_s=1.5,
         post_ready_sleep=0,
     )
-    assert res["status"] == "pass"
-    assert res["accuracy"]["score"] == 0.9689
+    assert res["status"] == status
+    assert res["accuracy"]["score"] == score
     assert res["accuracy"]["num"] == 1319
-    assert res["accuracy"]["within_band"] is True
+    assert res["accuracy"]["within_band"] is (status == "pass")
     assert res["accuracy"]["per_question"]["count"] == 2
+    assert res["accuracy"]["per_question"]["status"] == "baseline_incomplete"
     assert set(res["bench"].keys()) == {"c1", "c16"}
     assert [c["concurrency"] for c in bench_calls] == [1, 1, 16, 16]
     assert [c["num_prompts"] for c in bench_calls] == [2, 8, 8, 32]
@@ -526,6 +523,284 @@ def test_recipe_workflows_follow_security_and_shell_contracts() -> None:
     script = CI_DIR / "ppu_e2e_recipe_sanity.sh"
     res = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True)
     assert res.returncode == 0, res.stderr
+
+
+def test_prediction_only_file_cannot_supply_baseline(tmp_path: Path) -> None:
+    (tmp_path / "predictions.jsonl").write_text(
+        json.dumps({"id": "q0", "prediction": "text must not be published"}) + "\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "per_question.jsonl"
+    result = ppu_recipe_runner._extract_per_question_evalscope(
+        tmp_path, output, expected_count=1, aggregate_score=1.0, aggregate_num=1
+    )
+    assert result["count"] == 0
+    assert result["status"] == "baseline_incomplete"
+    assert output.read_text(encoding="utf-8") == ""
+
+
+def _review_fixture(run: str = "a") -> list[dict]:
+    path = (
+        ROOT
+        / "tests"
+        / "ut"
+        / "fixtures"
+        / (f"evalscope_1_14_1_gsm8k_main_reviews_{run}.jsonl")
+    )
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def _write_review(root: Path, rows: list[dict], model: str = "fixture") -> Path:
+    path = root / "20261118_102334" / "reviews" / model / "gsm8k_main.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    return path
+
+
+def _extract_review(root: Path) -> tuple[dict, list[dict]]:
+    report = json.loads(
+        (ROOT / "tests/ut/fixtures/evalscope_1_14_1_gsm8k_report_v2.json").read_text()
+    )
+    primary = next(
+        metric
+        for metric in report["metrics"]
+        if metric["identity"] == report["primary_metric_identity"]
+    )
+    output = root / "per_question.jsonl"
+    result = ppu_recipe_runner._extract_per_question_evalscope(
+        root,
+        output,
+        expected_count=12,
+        aggregate_score=primary["score"],
+        aggregate_num=primary["num"],
+    )
+    records = [json.loads(line) for line in output.read_text().splitlines()]
+    return result, records
+
+
+@pytest.mark.parametrize("prediction_first", [False, True])
+def test_extract_real_review_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, prediction_first: bool
+) -> None:
+    monkeypatch.setattr(
+        ppu_recipe_runner.importlib.metadata, "version", lambda name: "1.14.1"
+    )
+    source = _write_review(tmp_path, _review_fixture())
+    if prediction_first:
+        (tmp_path / "000_predictions.jsonl").write_text(
+            json.dumps({"id": "wrong", "prediction": "not a scored review"}) + "\n"
+        )
+        wrong_subset = source.with_name("gsm8k_other.jsonl")
+        wrong_subset.write_text(source.read_text())
+        wrong_dataset = source.with_name("aime24_main.jsonl")
+        wrong_dataset.write_text(source.read_text())
+    result, records = _extract_review(tmp_path)
+    assert result["status"] == "baseline_established"
+    assert result["reasons"] == []
+    assert result["count"] == result["unique_ids"] == 12
+    assert result["unscored"] == 0
+    assert result["correct_sum"] == 6
+    assert result["source_file"] == str(source.relative_to(tmp_path))
+    assert result["evalscope_version"] == "1.14.1"
+    assert result["dataset"] == "gsm8k"
+    assert result["subset"] == "main"
+    assert records[0] == {"question_id": "6", "correct": True, "score": 1.0}
+    assert all(set(item) == {"question_id", "correct", "score"} for item in records)
+
+
+@pytest.mark.parametrize("shape", ["accuracy", "acc", "numeric"])
+def test_extract_binary_accuracy_shapes(tmp_path: Path, shape: str) -> None:
+    rows = _review_fixture()
+    for row in rows:
+        score = row["sample_score"]["score"]
+        value = score["value"]["accuracy"]
+        score["value"] = value if shape == "numeric" else {shape: value}
+    _write_review(tmp_path, rows)
+    result, records = _extract_review(tmp_path)
+    assert result["status"] == "baseline_established"
+    assert sum(item["correct"] for item in records) == 6
+
+
+@pytest.mark.parametrize(
+    "case", ["prediction", "null", "fractional", "wrong_metric", "error", "malformed"]
+)
+def test_extract_unscored_rows_are_excluded(tmp_path: Path, case: str) -> None:
+    rows = _review_fixture()
+    if case == "prediction":
+        rows[0].pop("sample_score")
+        rows[0]["prediction"] = "not scored"
+    elif case == "null":
+        rows[0]["sample_score"]["score"]["value"] = None
+    elif case == "fractional":
+        rows[0]["sample_score"]["score"]["value"] = {"accuracy": 0.75}
+    elif case == "wrong_metric":
+        rows[0]["sample_score"]["score"]["value"] = {"latency": 1.0}
+    elif case == "error":
+        rows[0]["sample_score"]["score"]["status"] = "error"
+    source = _write_review(tmp_path, rows)
+    if case == "malformed":
+        source.write_text(source.read_text() + "{broken json\n")
+    result, records = _extract_review(tmp_path)
+    assert result["status"] == "baseline_incomplete"
+    assert result["unscored"] == 1
+    assert any("存在未评分题" in reason for reason in result["reasons"])
+    assert len(records) == (12 if case == "malformed" else 11)
+    assert all(item["correct"] is not None for item in records)
+
+
+@pytest.mark.parametrize("candidates", [0, 2])
+def test_review_source_must_be_unique(tmp_path: Path, candidates: int) -> None:
+    for i in range(candidates):
+        _write_review(tmp_path, _review_fixture(), model=f"fixture-{i}")
+    result, records = _extract_review(tmp_path)
+    assert result["status"] == "baseline_incomplete"
+    assert result["source_file"] is None
+    assert any("评分文件" in reason for reason in result["reasons"])
+    assert records == []
+
+
+def test_review_ids_pair_across_real_run_row_orders(tmp_path: Path) -> None:
+    assert _review_fixture("a") != _review_fixture("b")
+    paired = []
+    for run in ("a", "b"):
+        root = tmp_path / run
+        _write_review(root, _review_fixture(run))
+        result, records = _extract_review(root)
+        assert result["status"] == "baseline_established"
+        paired.append({item["question_id"]: item["correct"] for item in records})
+    assert paired[0] == paired[1]
+
+
+@pytest.mark.parametrize("missing", [False, True])
+def test_review_uses_dataset_index_not_line_number(
+    tmp_path: Path, missing: bool
+) -> None:
+    rows = _review_fixture()
+    rows[0]["sample_score"].pop("sample_id")
+    if missing:
+        rows[0].pop("index")
+    _write_review(tmp_path, rows)
+    result, records = _extract_review(tmp_path)
+    if missing:
+        assert result["status"] == "baseline_incomplete"
+        assert any("缺少稳定题目 ID" in reason for reason in result["reasons"])
+        assert len(records) == 11
+    else:
+        assert result["status"] == "baseline_established"
+        assert records[0]["question_id"] == "6"
+
+
+def test_review_output_drops_all_text(tmp_path: Path) -> None:
+    rows = _review_fixture()
+    for row in rows:
+        row["messages"] = [{"role": "user", "content": "private question"}]
+        row["prediction"] = "private prediction"
+        row["sample_score"]["score"]["explanation"] = "private explanation"
+    _write_review(tmp_path, rows)
+    _, records = _extract_review(tmp_path)
+    assert all(set(item) == {"question_id", "correct", "score"} for item in records)
+    assert "private" not in (tmp_path / "per_question.jsonl").read_text()
+
+
+def _baseline_records(count: int = 10) -> list[dict[str, object]]:
+    return [
+        {"question_id": str(i), "correct": i % 2 == 0, "score": float(i % 2 == 0)}
+        for i in range(count)
+    ]
+
+
+def test_per_question_baseline_established() -> None:
+    records = _baseline_records()
+    original = copy.deepcopy(records)
+    result = ppu_recipe_runner.assess_per_question_baseline(
+        records, expected_count=10, aggregate_score=0.5, aggregate_num=10
+    )
+    assert result == {
+        "status": "baseline_established",
+        "reasons": [],
+        "count": 10,
+        "unique_ids": 10,
+        "unscored": 0,
+        "correct_sum": 5,
+    }
+    assert records == original
+
+
+@pytest.mark.parametrize(
+    ("case", "reason"),
+    [
+        ("duplicate", "重复 ID"),
+        ("missing_id", "缺少稳定题目 ID"),
+        ("empty_id", "缺少稳定题目 ID"),
+        ("count", "数量不符"),
+        ("unscored", "存在未评分题"),
+        ("null", "存在未评分题"),
+        ("aggregate_count", "与汇总不一致"),
+        ("aggregate_score", "与汇总不一致"),
+        ("nonfinite", "与汇总不一致"),
+    ],
+)
+def test_per_question_baseline_incomplete(case: str, reason: str) -> None:
+    records = _baseline_records()
+    expected_count, aggregate_num, aggregate_score, unscored = 10, 10, 0.5, 0
+    if case == "duplicate":
+        records[1]["question_id"] = records[0]["question_id"]
+    elif case == "missing_id":
+        records[0]["question_id"] = None
+    elif case == "empty_id":
+        records[0]["question_id"] = ""
+    elif case == "count":
+        records = _baseline_records(1318)
+        expected_count, aggregate_num, aggregate_score = 1319, 1318, 0.5
+    elif case == "unscored":
+        unscored = 1
+    elif case == "null":
+        records[1]["correct"] = None
+    elif case == "aggregate_count":
+        aggregate_num = 11
+    elif case == "aggregate_score":
+        aggregate_score = 0.6
+    elif case == "nonfinite":
+        aggregate_score = float("nan")
+    result = ppu_recipe_runner.assess_per_question_baseline(
+        records,
+        expected_count=expected_count,
+        aggregate_score=aggregate_score,
+        aggregate_num=aggregate_num,
+        unscored=unscored,
+    )
+    assert result["status"] == "baseline_incomplete"
+    assert any(reason in item for item in result["reasons"])
+    if case in {"unscored", "null"}:
+        assert result["unscored"] == 1
+
+
+def test_per_question_baseline_reconciles_rounded_full_report() -> None:
+    records = [
+        {"question_id": str(i), "correct": i < 1278, "score": float(i < 1278)}
+        for i in range(1319)
+    ]
+    result = ppu_recipe_runner.assess_per_question_baseline(
+        records, expected_count=1319, aggregate_score=0.9689, aggregate_num=1319
+    )
+    assert result["status"] == "baseline_established"
+    assert result["correct_sum"] == 1278
+    records[0]["correct"] = False
+    records[0]["score"] = 0.0
+    result = ppu_recipe_runner.assess_per_question_baseline(
+        records, expected_count=1319, aggregate_score=0.9689, aggregate_num=1319
+    )
+    assert abs(1277 / 1319 - 0.9689) < 1 / 1319
+    assert result["status"] == "baseline_incomplete"
+    assert "与汇总不一致" in result["reasons"]
+
+
+def test_empty_per_question_baseline_is_incomplete() -> None:
+    result = ppu_recipe_runner.assess_per_question_baseline(
+        [], expected_count=1319, aggregate_score=0.0, aggregate_num=0
+    )
+    assert result["status"] == "baseline_incomplete"
+    assert result["count"] == result["unique_ids"] == result["correct_sum"] == 0
 
 
 @pytest.mark.requires_runtime
