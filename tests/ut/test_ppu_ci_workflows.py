@@ -431,7 +431,7 @@ def test_pr_pipeline_structure():
     for job_id, name, target in (
         ("pin-unit-tests", "PPU pin UT", "_ppu-pin-ut.yaml"),
         ("model-tests", "PPU model tests", "_ppu-model-tests.yaml"),
-        ("recipe-sanity", "PPU recipe fast sanity", "_ppu-recipe-sanity.yaml"),
+        ("recipe-sanity", "PPU recipe fast sanity", "_ppu-recipe-fast-sanity.yaml"),
         ("upstream-reuse", "PPU upstream reuse", "_ppu-upstream-reuse.yaml"),
     ):
         job = jobs[job_id]
@@ -899,7 +899,7 @@ def test_removing_ci_preview_cancels_active_preview_without_starting_jobs():
         ("build", "_ppu-build.yaml", ["build"]),
         ("pin-unit-tests", "_ppu-pin-ut.yaml", ["pin-unit-tests"]),
         ("model-tests", "_ppu-model-tests.yaml", ["prepare", "e2e"]),
-        ("recipe-sanity", "_ppu-recipe-sanity.yaml", ["prepare", "sanity"]),
+        ("recipe-sanity", "_ppu-recipe-fast-sanity.yaml", ["prepare", "sanity"]),
         ("upstream-reuse", "_ppu-upstream-reuse.yaml", ["upstream-reuse"]),
     ],
 )
@@ -1397,17 +1397,38 @@ def test_recipe_public_flag_controls_callers_and_gate(build_jobs, enabled):
         "needs.runtime-image.result": "success",
         "needs.build.result": "success",
     }
-    manual = workflow("ppu-recipe-sanity.yaml")["jobs"]
-    leaf = workflow("_ppu-recipe-sanity.yaml")["jobs"]
+    fast_manual = workflow("ppu-recipe-fast-sanity.yaml")["jobs"]
+    fast_leaf = workflow("_ppu-recipe-fast-sanity.yaml")["jobs"]
+    model_nightly = workflow("ppu-recipe-model-sanity-nightly.yaml")["jobs"]
+    model_leaf = workflow("_ppu-recipe-model-sanity.yaml")["jobs"]
+    accuracy_nightly = workflow("ppu-accuracy-nightly.yaml")["jobs"]
     for job in (
-        manual["build"],
-        manual["recipe-sanity"],
-        leaf["prepare"],
+        fast_manual["build"],
+        fast_manual["recipe-fast-sanity"],
+        fast_leaf["prepare"],
+        model_nightly["build"],
+        model_nightly["recipe-model-sanity"],
+        model_leaf["prepare"],
+        accuracy_nightly["recipe-model-sanity"],
         build_jobs["recipe-sanity"],
     ):
         assert bool(expression(job["if"], context)) == (enabled == "true")
-    assert manual["recipe-sanity"]["with"]["wheel_source_sha"] == "${{ github.sha }}"
-    assert manual["recipe-sanity"]["with"]["build_run_id"] == "${{ github.run_id }}"
+    assert (
+        fast_manual["recipe-fast-sanity"]["with"]["wheel_source_sha"]
+        == "${{ github.sha }}"
+    )
+    assert (
+        fast_manual["recipe-fast-sanity"]["with"]["build_run_id"]
+        == "${{ github.run_id }}"
+    )
+    assert (
+        model_nightly["recipe-model-sanity"]["with"]["wheel_source_sha"]
+        == "${{ github.sha }}"
+    )
+    assert (
+        model_nightly["recipe-model-sanity"]["with"]["build_run_id"]
+        == "${{ github.run_id }}"
+    )
     gate = build_jobs["gate"]["steps"][0]["run"].replace(
         "python - <<'PYTHON'", f"{sys.executable} - <<'PYTHON'"
     )
@@ -1434,17 +1455,19 @@ def test_recipe_public_flag_controls_callers_and_gate(build_jobs, enabled):
 
 
 @pytest.mark.parametrize(
-    "pr_mode,tier,build_run,allowed",
+    "leaf_name,pr_mode,tier,build_run,allowed",
     [
-        ("false", "model_sanity", "101", True),
-        ("false", "model_sanity", "100", False),
-        ("false", "fast_sanity", "100", False),
-        ("true", "fast_sanity", "100", True),
-        ("true", "model_sanity", "101", False),
+        ("_ppu-recipe-model-sanity.yaml", "false", "model_sanity", "101", True),
+        ("_ppu-recipe-model-sanity.yaml", "false", "model_sanity", "100", False),
+        ("_ppu-recipe-fast-sanity.yaml", "false", "fast_sanity", "100", False),
+        ("_ppu-recipe-fast-sanity.yaml", "true", "fast_sanity", "100", True),
+        ("_ppu-recipe-model-sanity.yaml", "true", "model_sanity", "101", False),
     ],
 )
-def test_recipe_workflow_refuses_arbitrary_wheel_run(pr_mode, tier, build_run, allowed):
-    prepare = workflow("_ppu-recipe-sanity.yaml")["jobs"]["prepare"]
+def test_recipe_workflow_refuses_arbitrary_wheel_run(
+    leaf_name, pr_mode, tier, build_run, allowed
+):
+    prepare = workflow(leaf_name)["jobs"]["prepare"]
     select = next(step for step in prepare["steps"] if step.get("id") == "select")
     script = select["run"].partition("python3 scripts/ci/ppu_e2e_select.py")[0]
     result = subprocess.run(
@@ -1460,11 +1483,15 @@ def test_recipe_workflow_refuses_arbitrary_wheel_run(pr_mode, tier, build_run, a
     assert (result.returncode == 0) is allowed
 
 
+@pytest.mark.parametrize(
+    "leaf_name",
+    ["_ppu-recipe-fast-sanity.yaml", "_ppu-recipe-model-sanity.yaml"],
+)
 @pytest.mark.parametrize("exit_code,status", [(0, "pass"), (3, "fail")])
 def test_recipe_publication_excludes_raw_launcher_logs_and_results(
-    tmp_path, exit_code, status
+    tmp_path, leaf_name, exit_code, status
 ):
-    steps = workflow("_ppu-recipe-sanity.yaml")["jobs"]["sanity"]["steps"]
+    steps = workflow(leaf_name)["jobs"]["sanity"]["steps"]
     runtime = next(step for step in steps if step.get("id") == "recipe")
     publish = next(step for step in steps if step.get("id") == "publish")
     upload = next(

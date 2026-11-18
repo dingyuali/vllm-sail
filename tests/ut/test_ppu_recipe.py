@@ -554,10 +554,37 @@ def test_stop_server_kills_outliving_process_group_worker(tmp_path: Path) -> Non
 
 
 def test_recipe_workflows_follow_security_and_shell_contracts() -> None:
-    for wf_name in ("_ppu-recipe-sanity.yaml", "ppu-recipe-sanity.yaml"):
+    for wf_name in (
+        "_ppu-recipe-fast-sanity.yaml",
+        "ppu-recipe-fast-sanity.yaml",
+        "_ppu-recipe-model-sanity.yaml",
+        "ppu-recipe-model-sanity-nightly.yaml",
+    ):
         wf = yaml.safe_load((ROOT / ".github" / "workflows" / wf_name).read_text())
         assert wf["cache-mode"] == "none"
         assert wf["permissions"] == {"contents": "read", "actions": "read"}
+    fast_wf = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "_ppu-recipe-fast-sanity.yaml").read_text()
+    )
+    assert fast_wf["jobs"]["sanity"]["steps"][-3]["env"]["TIER"] == "fast_sanity"
+    model_wf = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "_ppu-recipe-model-sanity.yaml").read_text()
+    )
+    assert model_wf["jobs"]["sanity"]["steps"][-3]["env"]["TIER"] == "model_sanity"
+    pr_wf = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "ppu-build-and-test.yaml").read_text()
+    )
+    assert (
+        pr_wf["jobs"]["recipe-sanity"]["uses"]
+        == "./.github/workflows/_ppu-recipe-fast-sanity.yaml"
+    )
+    nightly_wf = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "ppu-accuracy-nightly.yaml").read_text()
+    )
+    assert (
+        nightly_wf["jobs"]["recipe-model-sanity"]["uses"]
+        == "./.github/workflows/_ppu-recipe-model-sanity.yaml"
+    )
     script = CI_DIR / "ppu_e2e_recipe_sanity.sh"
     res = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True)
     assert res.returncode == 0, res.stderr

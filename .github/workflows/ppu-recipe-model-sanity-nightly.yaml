@@ -1,27 +1,25 @@
-name: PPU recipe sanity dispatch
-run-name: "PPU recipe ${{ inputs.tier }}: ${{ inputs.models || 'all' }}"
+name: PPU recipe model sanity nightly
+run-name: "PPU recipe model_sanity: ${{ inputs.models || 'all' }}"
 
 on:
   workflow_dispatch:
     inputs:
-      tier:
-        description: Sanity tier (fast_sanity or model_sanity)
-        required: true
-        type: choice
-        options:
-          - fast_sanity
-          - model_sanity
-        default: fast_sanity
       models:
         description: Comma-separated recipe policy slugs (blank = all)
         required: false
         default: glm-5.3,deepseek-v4-flash
         type: string
+  schedule:
+    - cron: "0 14 * * *"
 
 permissions:
   contents: read
   actions: read
 cache-mode: none
+
+concurrency:
+  group: recipe-model-sanity-nightly-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -31,8 +29,8 @@ jobs:
     with:
       pr_head_sha: ${{ github.sha }}
 
-  recipe-sanity:
-    name: Recipe sanity
+  recipe-model-sanity:
+    name: Recipe model sanity & micro-E2E
     needs: build
     if: >-
       ${{ !cancelled() && vars.PPU_RECIPE_PUBLIC_ENABLED == 'true' &&
@@ -40,11 +38,10 @@ jobs:
     permissions:
       contents: read
       actions: read
-    uses: ./.github/workflows/_ppu-recipe-sanity.yaml
+    uses: ./.github/workflows/_ppu-recipe-model-sanity.yaml
     with:
       pr_mode: false
       pr_head_sha: ${{ github.sha }}
       wheel_source_sha: ${{ github.sha }}
       build_run_id: ${{ github.run_id }}
-      tier: ${{ inputs.tier }}
       models: ${{ inputs.models }}

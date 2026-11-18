@@ -22,7 +22,7 @@ CI_REUSE_FILES = set(
     f".github/workflows/{WORKFLOW} .github/workflows/ppu-build-and-test.yaml "
     ".github/workflows/ut.yaml "
     ".github/workflows/_ppu-build.yaml .github/workflows/_ppu-pin-ut.yaml "
-    ".github/workflows/_ppu-model-tests.yaml .github/workflows/_ppu-recipe-sanity.yaml "
+    ".github/workflows/_ppu-model-tests.yaml .github/workflows/_ppu-recipe-fast-sanity.yaml "
     ".github/workflows/_ppu-upstream-reuse.yaml "
     "scripts/ci/ppu_ci_command.py "
     "scripts/ci/ppu_e2e_recipe_sanity.sh scripts/ci/ppu_recipe.py "

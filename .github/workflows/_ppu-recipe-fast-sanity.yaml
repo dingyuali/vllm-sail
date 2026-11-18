@@ -1,4 +1,4 @@
-name: PPU recipe sanity
+name: PPU recipe fast sanity
 
 on:
   workflow_call:
@@ -17,10 +17,6 @@ on:
         description: Run supplying the ppu-wheels artifact
         required: true
         type: string
-      tier:
-        description: Recipe validation tier (fast_sanity or model_sanity)
-        type: string
-        default: fast_sanity
       models:
         description: Comma-separated recipe policy slugs (blank = all)
         type: string
@@ -32,12 +28,12 @@ permissions:
 cache-mode: none
 
 concurrency:
-  group: recipe-sanity-${{ github.ref }}-${{ inputs.pr_mode && github.run_id || inputs.build_run_id }}-${{ inputs.tier }}-${{ inputs.models }}
+  group: recipe-fast-sanity-${{ github.ref }}-${{ inputs.pr_mode && github.run_id || inputs.build_run_id }}-${{ inputs.models }}
   cancel-in-progress: false
 
 jobs:
   prepare:
-    name: Resolve recipe matrix
+    name: Resolve fast sanity matrix
     if: vars.PPU_RECIPE_PUBLIC_ENABLED == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -64,11 +60,11 @@ jobs:
           EXPECTED_SHA: ${{ inputs.pr_head_sha || github.sha }}
         run: test "$(git -c safe.directory="$PWD" rev-parse HEAD)" = "$EXPECTED_SHA"
 
-      - name: Select recipe sanity models
+      - name: Select recipe fast sanity models
         id: select
         env:
           MODELS: ${{ inputs.models }}
-          TIER: ${{ inputs.tier }}
+          TIER: fast_sanity
           PR_MODE: ${{ inputs.pr_mode }}
           BUILD_RUN_ID: ${{ inputs.build_run_id }}
         run: |
@@ -81,10 +77,10 @@ jobs:
           printf 'ready_epoch=%s\n' "$(date +%s)" >> "$GITHUB_OUTPUT"
 
   sanity:
-    name: Recipe ${{ inputs.tier }} ${{ matrix.model.key }}
+    name: Fast sanity ${{ matrix.model.key }}
     needs: prepare
     runs-on: 8-ppu-m890p
-    timeout-minutes: 240
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -151,7 +147,7 @@ jobs:
           repository: ${{ github.repository }}
           github-token: ${{ github.token }}
 
-      - name: Run recipe sanity in the PPU runtime container
+      - name: Run recipe fast sanity in the PPU runtime container
         id: recipe
         env:
           PPU_CI_SOURCE_DIR: ${{ steps.runtime.outputs.source }}
@@ -164,7 +160,7 @@ jobs:
           MODEL_ID: ${{ matrix.model.model_id }}
           RECIPE_PATH: ${{ matrix.model.recipe_path }}
           POLICY_PATH: ${{ matrix.model.policy_path }}
-          TIER: ${{ inputs.tier }}
+          TIER: fast_sanity
           PPU_CI_QUEUE_S: ${{ steps.runtime.outputs.queue_s }}
         run: |
           umask 077
@@ -192,7 +188,7 @@ jobs:
         if: always() && steps.publish.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: ppu-recipe-${{ inputs.tier }}-${{ matrix.model.key }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ppu-recipe-fast_sanity-${{ matrix.model.key }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ steps.runtime.outputs.public }}/summary.json
           if-no-files-found: error
           retention-days: 14

@@ -148,3 +148,19 @@ jobs:
       # which for a workflow_call is this nightly run.
       build_run_id: ${{ github.run_id }}
       models: ${{ matrix.model }}
+
+  recipe-model-sanity:
+    name: Recipe model sanity & micro-E2E
+    needs: [build]
+    if: >-
+      ${{ !cancelled() && vars.PPU_RECIPE_PUBLIC_ENABLED == 'true' &&
+      needs.build.result == 'success' }}
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/_ppu-recipe-model-sanity.yaml
+    with:
+      pr_mode: false
+      pr_head_sha: ${{ github.sha }}
+      wheel_source_sha: ${{ github.sha }}
+      build_run_id: ${{ github.run_id }}

@@ -210,7 +210,7 @@ jobs:
     permissions:
       contents: read
       actions: read
-    uses: ./.github/workflows/_ppu-recipe-sanity.yaml
+    uses: ./.github/workflows/_ppu-recipe-fast-sanity.yaml
     with:
       pr_mode: true
       pr_head_sha: ${{ inputs.pr_head_sha || github.sha }}
