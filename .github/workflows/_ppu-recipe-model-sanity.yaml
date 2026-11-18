@@ -173,6 +173,7 @@ jobs:
           PPU_CI_ARTIFACT_DIR: ${{ steps.runtime.outputs.artifacts }}
           TIER: model_sanity
           MODEL_KEY: ${{ matrix.model.key }}
+          RECIPE_OUTCOME: ${{ steps.recipe.outcome }}
         run: |
           umask 077
           python3 -I "${PPU_CI_SOURCE_DIR}/scripts/ci/ppu_recipe_retention.py"
@@ -184,9 +185,11 @@ jobs:
           RECIPE_OUTCOME: ${{ steps.recipe.outcome }}
           RETENTION_OUTCOME: ${{ steps.retain.outcome }}
           RETENTION: ${{ steps.retain.outputs.retention }}
+          PPU_CI_SOURCE_DIR: ${{ steps.runtime.outputs.source }}
           MODEL_KEY: ${{ matrix.model.key }}
           PRIVATE_DIR: ${{ steps.runtime.outputs.artifacts }}
           PUBLIC_DIR: ${{ steps.runtime.outputs.public }}
+          TIER: model_sanity
         run: |
           case "$RECIPE_OUTCOME" in
             success) if [[ "$RETENTION_OUTCOME" == success ]]; then status=pass; else status=fail; fi ;;
@@ -198,8 +201,12 @@ jobs:
             retained|not_configured|failed) retention="$RETENTION" ;;
             *) retention=failed ;;
           esac
-          printf 'Recipe sanity: %s\nretention: %s\n' "$status" "$retention"
-          python3 -I - "$status" "$retention" <<'PY'
+          reason=not_applicable
+          if [[ "$RECIPE_OUTCOME" == failure ]]; then
+            reason=$(python3 -I "${PPU_CI_SOURCE_DIR}/scripts/ci/ppu_recipe_diagnostics.py")
+          fi
+          printf 'Recipe sanity: %s\nretention: %s\nfailure_reason: %s\n' "$status" "$retention" "$reason"
+          python3 -I - "$status" "$retention" "$reason" <<'PY'
           import json
           import os
           import re
@@ -243,6 +250,7 @@ jobs:
               "model_key": model if re.fullmatch(r"[a-z0-9][a-z0-9.-]{0,63}", model) else None,
               "status": sys.argv[1],
               "retention": sys.argv[2],
+              "failure_reason": sys.argv[3],
               "gsm8k": {
                   "score": number(accuracy.get("score"), 0, 1),
                   "evaluated_samples": count(accuracy.get("num")),
@@ -263,6 +271,7 @@ jobs:
               f"### Recipe model sanity: {public['model_key'] or 'unknown model'}",
               "",
               f"- **Result:** {public['status']} · **Private retention:** {public['retention']}",
+              f"- **Recipe failure reason:** {public['failure_reason']}",
               f"- **GSM8K accuracy:** {percent(gsm8k['score'])} (golden: {percent(gsm8k['golden_score'])})",
               "- **GSM8K samples (evaluated / expected):** "
               f"{display_count(gsm8k['evaluated_samples'])} / {display_count(gsm8k['expected_samples'])}",

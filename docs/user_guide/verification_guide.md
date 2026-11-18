@@ -111,23 +111,30 @@ The PR recipe job runs `fast_sanity`. The registered accuracy nightly runs
 `model_sanity` (including GSM8K and micro-E2E). The runner administrator must
 set `PPU_CI_PRIVATE_RESULTS_ROOT` in the runner service environment on every
 eligible runner to retain private results after the runtime container exits.
-Provision a persistent, runner-writable directory outside the job workspace and
-temporary storage, with mode `0700` and access restricted to the trusted runner
-service identity. Retained directories and files use modes `0700` and `0600`.
+Provision a persistent root outside the job workspace and temporary storage with
+mode `0700` or `0755`. The `vllm-sail` subdirectory must be `0700` and writable
+by the runner service identity. Pre-create it if the runner cannot write to the
+root. Mode `0755` allows others to list the root, not to enter the private
+subdirectory. Retained directories and files use modes `0700` and `0600`.
 Set an operator-managed cleanup policy based on the baseline comparison window
 and available space; remove expired run attempts and abandoned staging directories
 only when no writer is active.
 
-The public console reports the recipe outcome and retention status (`retained`,
-`not_configured`, or `failed`). The nightly job summary and downloadable
+The console, job summary, and downloadable summary report the recipe outcome,
+retention status (`retained`, `not_configured`, or `failed`), and an allowlisted
+recipe failure reason. For example, `server_readiness_timeout` means the server
+did not become ready; `gsm8k_gate_failed` means evaluation produced a result
+that did not satisfy the golden gate. Unclassified failures report `unknown`.
+The nightly job summary and downloadable
 artifact also report aggregate GSM8K accuracy, sample counts, golden score,
 gate bounds and verdict, micro-E2E verdict, and baseline completeness. They
 never include raw results, per-question scores, provenance, or logs. Metrics
 that were not produced are reported as unavailable. An unset or empty variable
 warns in either tier without changing the recipe verdict; no private baseline
 is retained for that run. A configured copy failure still fails either job.
-Public upload does not replace private retention. `retained` confirms a
-private copy, not a complete or comparable GSM8K baseline.
+Private retention includes the launcher, container and model-server logs that
+were produced, even when a failed recipe did not write a result summary.
+`retained` confirms a private copy, not a complete or comparable GSM8K baseline.
 
 ### Upstream test reuse
 

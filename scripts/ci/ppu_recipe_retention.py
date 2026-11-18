@@ -7,14 +7,21 @@ import stat
 import tempfile
 from pathlib import Path
 
-REQUIRED_FILES = ("results/summary.json", "provenance.json", "launcher.log")
-OPTIONAL_FILE = "results/gsm8k_per_question.jsonl"
+RESULT_FILES = ("results/summary.json", "provenance.json")
+OPTIONAL_FILES = (
+    "runtime.log",
+    "recipe-phase.txt",
+    "results/gsm8k_per_question.jsonl",
+    "results/vllm_serve_fast_2l.log",
+    "results/vllm_serve_fast_full.log",
+    "results/vllm_serve_model_sanity.log",
+)
 
 
-def _check_private_dir(directory: Path) -> None:
+def _check_dir_mode(directory: Path, *allowed_modes: int) -> None:
     mode = directory.lstat().st_mode
-    if not stat.S_ISDIR(mode) or stat.S_IMODE(mode) != 0o700:
-        raise ValueError("expected a private directory")
+    if not stat.S_ISDIR(mode) or stat.S_IMODE(mode) not in allowed_modes:
+        raise ValueError("unexpected retention directory type or mode")
 
 
 def retain(environ) -> None:
@@ -36,7 +43,7 @@ def retain(environ) -> None:
     root = Path(environ["PPU_CI_PRIVATE_RESULTS_ROOT"])
     if not root.is_absolute():
         raise ValueError("expected an absolute retention root")
-    _check_private_dir(root)
+    _check_dir_mode(root, 0o700, 0o755)
     root = root.resolve(strict=True)
     for key in ("RUNNER_TEMP", "GITHUB_WORKSPACE"):
         ephemeral = Path(environ[key]).resolve()
@@ -50,28 +57,39 @@ def retain(environ) -> None:
         index["tier"],
     ):
         parent /= component
-        parent.mkdir(mode=0o700, exist_ok=True)
-        _check_private_dir(parent)
+        try:
+            _check_dir_mode(parent, 0o700)
+        except FileNotFoundError:
+            parent.mkdir(mode=0o700, exist_ok=True)
+            _check_dir_mode(parent, 0o700)
 
     destination = parent / index["model_key"]
     if os.path.lexists(destination):
         raise FileExistsError("retention destination already exists")
 
     source_dir = Path(environ["PPU_CI_ARTIFACT_DIR"])
-    if not stat.S_ISDIR((source_dir / "results").lstat().st_mode):
-        raise ValueError("expected a recipe results directory")
+    partial = environ.get("RECIPE_OUTCOME") in ("failure", "cancelled")
+    try:
+        if not stat.S_ISDIR((source_dir / "results").lstat().st_mode):
+            raise ValueError("expected a recipe results directory")
+    except FileNotFoundError:
+        if not partial:
+            raise
+    required = {"launcher.log"}
+    if not partial:
+        required.update(RESULT_FILES)
     with tempfile.TemporaryDirectory(prefix=".staging-", dir=parent) as staging_dir:
         staging = Path(staging_dir)
         published = staging / index["model_key"]
         published.mkdir(mode=0o700)
         files = {}
-        for relative_path in (*REQUIRED_FILES, OPTIONAL_FILE):
+        for relative_path in ("launcher.log", *RESULT_FILES, *OPTIONAL_FILES):
             source = source_dir / relative_path
             name = source.name
             try:
                 mode = source.lstat().st_mode
             except FileNotFoundError:
-                if relative_path == OPTIONAL_FILE:
+                if relative_path not in required:
                     continue
                 raise
             if not stat.S_ISREG(mode):

@@ -176,6 +176,7 @@ jobs:
           PPU_CI_ARTIFACT_DIR: ${{ steps.runtime.outputs.artifacts }}
           TIER: fast_sanity
           MODEL_KEY: ${{ matrix.model.key }}
+          RECIPE_OUTCOME: ${{ steps.recipe.outcome }}
         run: |
           umask 077
           python3 -I "${PPU_CI_SOURCE_DIR}/scripts/ci/ppu_recipe_retention.py"
@@ -187,7 +188,10 @@ jobs:
           RECIPE_OUTCOME: ${{ steps.recipe.outcome }}
           RETENTION_OUTCOME: ${{ steps.retain.outcome }}
           RETENTION: ${{ steps.retain.outputs.retention }}
+          PPU_CI_SOURCE_DIR: ${{ steps.runtime.outputs.source }}
+          PRIVATE_DIR: ${{ steps.runtime.outputs.artifacts }}
           PUBLIC_DIR: ${{ steps.runtime.outputs.public }}
+          TIER: fast_sanity
         run: |
           case "$RECIPE_OUTCOME" in
             success) if [[ "$RETENTION_OUTCOME" == success ]]; then status=pass; else status=fail; fi ;;
@@ -199,8 +203,12 @@ jobs:
             retained|not_configured|failed) retention="$RETENTION" ;;
             *) retention=failed ;;
           esac
-          printf 'Recipe sanity: %s\nretention: %s\n' "$status" "$retention" | tee -a "$GITHUB_STEP_SUMMARY"
-          printf '{"status":"%s","retention":"%s"}\n' "$status" "$retention" > "$PUBLIC_DIR/summary.json"
+          reason=not_applicable
+          if [[ "$RECIPE_OUTCOME" == failure ]]; then
+            reason=$(python3 -I "${PPU_CI_SOURCE_DIR}/scripts/ci/ppu_recipe_diagnostics.py")
+          fi
+          printf 'Recipe sanity: %s\nretention: %s\nfailure_reason: %s\n' "$status" "$retention" "$reason" | tee -a "$GITHUB_STEP_SUMMARY"
+          printf '{"status":"%s","retention":"%s","failure_reason":"%s"}\n' "$status" "$retention" "$reason" > "$PUBLIC_DIR/summary.json"
 
       - name: Upload recipe sanity status
         if: always() && steps.publish.outcome == 'success'

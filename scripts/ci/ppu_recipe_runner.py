@@ -143,6 +143,11 @@ def _stop_server(
         pass
 
 
+def _record_phase(phase: str) -> None:
+    if phase_file := os.environ.get("PPU_RECIPE_PHASE_FILE"):
+        Path(phase_file).write_text(phase + "\n", encoding="utf-8")
+
+
 def _wait_server_ready(
     proc: subprocess.Popen[bytes],
     log_path: Path,
@@ -175,6 +180,7 @@ def _wait_server_ready(
         if log_path.exists()
         else ""
     )
+    _record_phase("server_readiness_timeout")
     raise RuntimeError(f"server not ready within {timeout}s.\n{tail}")
 
 
@@ -479,6 +485,7 @@ def _attempt_fast_sanity_once(
     proc: subprocess.Popen[bytes] | None = None
     t_start = time.monotonic()
     try:
+        _record_phase("server_startup")
         proc = _launch_resolved_server(resolved, log_path=log_path)
         cold_start_s = _wait_server_ready(
             proc,
@@ -487,6 +494,7 @@ def _attempt_fast_sanity_once(
             expected_served_name=base_name,
             timeout=ready_timeout,
         )
+        _record_phase("chat_probe")
         t_eval0 = time.monotonic()
         probe_res = _send_chat_probe(port=port, served_name=base_name, probe=probe)
         eval_s = round(time.monotonic() - t_eval0, 3)
@@ -733,6 +741,7 @@ def run_model_sanity(
     log_path = results_dir / "vllm_serve_model_sanity.log"
     proc: subprocess.Popen[bytes] | None = None
     try:
+        _record_phase("server_startup")
         proc = _launch_resolved_server(resolved, log_path=log_path)
         ready_budget = max(
             ready_timeout,
@@ -755,6 +764,7 @@ def run_model_sanity(
         )
 
         # 1. Deterministic sanity probe
+        _record_phase("chat_probe")
         probe_res = _send_chat_probe(
             port=port,
             served_name=unique_served,
@@ -762,6 +772,7 @@ def run_model_sanity(
         )
 
         # 2. Full GSM8K via evalscope
+        _record_phase("gsm8k_eval")
         eval_t0 = time.monotonic()
         eval_work_dir = results_dir / "evalscope"
         gen_cfg = dict(eval_stage["generation"])
@@ -830,6 +841,7 @@ def run_model_sanity(
         # 4. Micro-perf bench (C=1, C=16) marked sanity_throughput_guard
         bench_stage = stages["bench"]
         bench_input = bench_stage["input"]
+        _record_phase("micro_e2e")
         bench_dir = results_dir / "bench"
         bench_dir.mkdir(parents=True, exist_ok=True)
         bench_t0 = time.monotonic()

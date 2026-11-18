@@ -28,6 +28,12 @@ RESULTS_DIR="$(cd -- "${RESULTS_DIR}" && pwd)"
 rm -f -- "${RESULTS_DIR}/provenance.json"
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY || true
 
+export PPU_RECIPE_PHASE_FILE="${RESULTS_DIR}/recipe-phase.txt"
+record_phase() {
+    printf '%s\n' "$1" >"${PPU_RECIPE_PHASE_FILE}"
+}
+
+record_phase wheel_verification
 WHEELS_DIR="$(cd -- "${WHEELS_DIR}" && pwd)"
 verified_wheels="$(python -IB - "${ROOT_DIR}" "${WHEELS_DIR}" "${RESULTS_DIR}" \
     "${RECIPE_PATH}" "${POLICY_PATH}" "${TIER}" "${REQUIRE_PR_ARTIFACT:-false}" \
@@ -116,6 +122,7 @@ PY
 vllm_wheel="${verified_wheels%%$'\n'*}"
 sail_wheel="${verified_wheels#*$'\n'}"
 
+record_phase runtime_dependencies
 export PIP_CONSTRAINT="/tmp/ppu-recipe-image-constraints.txt"
 python "${ROOT_DIR}/scripts/ci/ppu_image_stack.py" capture \
     --sdk /usr/local/PPU_SDK --output "/tmp/ppu-recipe-image-stack.json" \
@@ -136,6 +143,7 @@ python "${ROOT_DIR}/scripts/ci/ppu_image_stack.py" verify \
 cd /tmp
 unset PYTHONPATH
 
+record_phase platform_check
 python - <<'PY'
 import torch
 from vllm.platforms import current_platform
@@ -146,6 +154,7 @@ assert current_platform.is_ppu(), f"expected PPU platform, got {current_platform
 assert torch.cuda.is_available(), "PPU device required"
 PY
 
+record_phase model_cache_check
 python - "${MODEL_ID}" <<'PY'
 import sys
 from huggingface_hub import snapshot_download
@@ -153,6 +162,7 @@ from huggingface_hub import snapshot_download
 snapshot_download(repo_id=sys.argv[1], local_files_only=True)
 PY
 
+record_phase recipe_validation
 python "${ROOT_DIR}/scripts/ci/ppu_recipe.py" validate --all --require-vllm-parser
 
 runner_args=(
