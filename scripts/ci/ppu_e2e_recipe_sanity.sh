@@ -24,23 +24,105 @@ VLLM_PORT="${VLLM_PORT:-9985}"
 PPU_CI_QUEUE_S="${PPU_CI_QUEUE_S:-0}"
 
 mkdir -p "${RESULTS_DIR}"
+RESULTS_DIR="$(cd -- "${RESULTS_DIR}" && pwd)"
+rm -f -- "${RESULTS_DIR}/provenance.json"
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY || true
 
 WHEELS_DIR="$(cd -- "${WHEELS_DIR}" && pwd)"
-python "${ROOT_DIR}/scripts/ci/ppu_wheel_manifest.py" verify "${WHEELS_DIR}"
+verified_wheels="$(python -IB - "${ROOT_DIR}" "${WHEELS_DIR}" "${RESULTS_DIR}" \
+    "${RECIPE_PATH}" "${POLICY_PATH}" "${TIER}" "${REQUIRE_PR_ARTIFACT:-false}" \
+    "${PPU_RECIPE_SOURCE_SHA:?PPU_RECIPE_SOURCE_SHA is required}" \
+    "${EXPECTED_VLLM_COMMIT:?EXPECTED_VLLM_COMMIT is required}" \
+    "${EXPECTED_SAIL_COMMIT:?EXPECTED_SAIL_COMMIT is required}" <<'PY'
+import hashlib
+import json
+import re
+import sys
+from pathlib import Path
+
+(root, wheels, results, recipe, policy, tier, require_pr, checkout, vllm, sail) = sys.argv[1:]
+if not all(re.fullmatch(r"[0-9a-f]{40}", sha) for sha in (checkout, vllm, sail)):
+    raise SystemExit("Recipe provenance requires exact checkout and wheel commit SHAs")
+if tier not in {"fast_sanity", "model_sanity"} or require_pr not in {"true", "false"}:
+    raise SystemExit("Invalid recipe tier or PR artifact mode")
+exact_source_match = checkout == sail
+if not exact_source_match and (require_pr != "true" or tier != "fast_sanity"):
+    raise SystemExit("SAIL wheel revision must match the recipe checkout outside PR fast_sanity")
+
+root = Path(root).resolve()
+wheels = Path(wheels)
+sys.path.insert(0, str(root / "scripts/ci"))
+from ppu_wheel_manifest import verify
+
+try:
+    manifest = verify(wheels, vllm_commit=vllm, sail_commit=sail)
+except Exception as error:
+    raise SystemExit(f"Wheel manifest verification failed ({type(error).__name__})") from None
+
+
+def source_record(relative):
+    if Path(relative).is_absolute():
+        raise ValueError("source paths must be checkout-relative")
+    path = (root / relative).resolve(strict=True)
+    return {
+        "path": path.relative_to(root).as_posix(),
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    }
+
+
+try:
+    recipes = root / "tests/ppu/recipes"
+    if not recipes.is_dir() or recipes.is_symlink():
+        raise ValueError("invalid recipes tree")
+    tree_digest = hashlib.sha256()
+    for path in sorted(recipes.rglob("*"), key=lambda path: path.relative_to(recipes).as_posix()):
+        if path.is_symlink():
+            raise ValueError("symlink in recipes tree")
+        if path.is_file():
+            tree_digest.update(path.relative_to(recipes).as_posix().encode("utf-8") + b"\0")
+            tree_digest.update(hashlib.sha256(path.read_bytes()).digest())
+
+    provenance = {
+        "schema": 1,
+        "checkout_sha": checkout,
+        "commits": {name: manifest["commits"][name] for name in ("vllm", "vllm-sail")},
+        "wheels": manifest["wheels"],
+        "tier": tier,
+        "exact_source_match": exact_source_match,
+        "recipe": source_record(recipe),
+        "recipes_tree_sha256": tree_digest.hexdigest(),
+        "policy": source_record(policy),
+        "runner_sources": [
+            source_record(path) for path in (
+                "scripts/ci/ppu_e2e_recipe_sanity.sh",
+                "scripts/ci/ppu_recipe.py",
+                "scripts/ci/ppu_recipe_runner.py",
+                "scripts/eval/ppu_gsm8k_eval.py",
+            )
+        ],
+    }
+    wheel_paths = [str(wheels / manifest["wheels"][name]["file"]) for name in ("vllm", "vllm-sail")]
+    if any("\n" in path for path in wheel_paths):
+        raise ValueError("newline in wheel path")
+    (Path(results) / "provenance.json").write_text(
+        json.dumps(provenance, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+except (OSError, ValueError) as error:
+    raise SystemExit(f"Recipe provenance recording failed ({type(error).__name__})") from None
+
+print(*wheel_paths, sep="\n")
+PY
+)"
+vllm_wheel="${verified_wheels%%$'\n'*}"
+sail_wheel="${verified_wheels#*$'\n'}"
 
 export PIP_CONSTRAINT="/tmp/ppu-recipe-image-constraints.txt"
 python "${ROOT_DIR}/scripts/ci/ppu_image_stack.py" capture \
     --sdk /usr/local/PPU_SDK --output "/tmp/ppu-recipe-image-stack.json" \
     --constraints "${PIP_CONSTRAINT}"
 
-mapfile -t vllm_wheels < <(find "${WHEELS_DIR}" -type f -name 'vllm-*.whl' -print | sort)
-mapfile -t sail_wheels < <(find "${WHEELS_DIR}" -type f -name 'vllm_sail-*.whl' -print | sort)
-((${#vllm_wheels[@]} == 1)) || { echo "expected one vLLM wheel under ${WHEELS_DIR}" >&2; exit 1; }
-((${#sail_wheels[@]} == 1)) || { echo "expected one vLLM SAIL wheel under ${WHEELS_DIR}" >&2; exit 1; }
-
-python -m pip install --no-deps --force-reinstall "${vllm_wheels[0]}"
-python -m pip install --no-deps --force-reinstall "${sail_wheels[0]}"
+python -m pip install --no-deps --force-reinstall "${vllm_wheel}"
+python -m pip install --no-deps --force-reinstall "${sail_wheel}"
 PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
     python -m pip install -r "${ROOT_DIR}/requirements/ci-runtime.txt"
 if [[ "${TIER}" == "model_sanity" ]]; then
@@ -77,7 +159,7 @@ runner_args=(
     --recipe "${ROOT_DIR}/${RECIPE_PATH}"
     --policy "${ROOT_DIR}/${POLICY_PATH}"
     --tier "${TIER}"
-    --results-dir "/tmp/recipe-run"
+    --results-dir "${RESULTS_DIR}/results"
     --port "${VLLM_PORT}"
     --layer-mode "${LAYER_MODE}"
     --vllm-parser required
@@ -87,43 +169,4 @@ if [[ -n "${PRESET}" ]]; then
     runner_args+=(--preset "${PRESET}")
 fi
 
-set +e
 python "${ROOT_DIR}/scripts/ci/ppu_recipe_runner.py" "${runner_args[@]}"
-rc=$?
-set -e
-
-if [[ -f "/tmp/recipe-run/summary.json" ]]; then
-    python - "${ROOT_DIR}/scripts/ci/ppu_recipe.py" "/tmp/recipe-run/summary.json" "${RESULTS_DIR}/summary.json" <<'PY'
-import json
-import shutil
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(sys.argv[1]).parent))
-import ppu_recipe
-
-src = Path(sys.argv[2])
-dst = Path(sys.argv[3])
-data = json.loads(src.read_text(encoding="utf-8"))
-ppu_recipe.redact_and_verify_public_payload(data, allow_loopback=True)
-shutil.copy2(src, dst)
-PY
-fi
-
-if [[ -f "/tmp/recipe-run/gsm8k_per_question.jsonl" ]]; then
-    python - "${ROOT_DIR}/scripts/ci/ppu_recipe.py" "/tmp/recipe-run/gsm8k_per_question.jsonl" "${RESULTS_DIR}/gsm8k_per_question.jsonl" <<'PY'
-import shutil
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(sys.argv[1]).parent))
-import ppu_recipe
-
-src = Path(sys.argv[2])
-dst = Path(sys.argv[3])
-ppu_recipe.redact_and_verify_public_payload(src.read_text(encoding="utf-8"), allow_loopback=True)
-shutil.copy2(src, dst)
-PY
-fi
-
-exit "${rc}"

@@ -652,9 +652,21 @@ def _run_vllm_bench(
     ]
     if trust_remote_code:
         cmd.append("--trust-remote-code")
-    subprocess.run(cmd, check=True)
     out_file = result_dir / result_filename
+    out_file.unlink(missing_ok=True)
+    subprocess.run(cmd, check=True)
     return json.loads(out_file.read_text(encoding="utf-8"))
+
+
+def _bench_completed(result: Any, expected: int) -> bool:
+    return (
+        expected > 0
+        and isinstance(result, dict)
+        and type(result.get("completed")) is int
+        and result["completed"] == expected
+        and type(result.get("failed")) is int
+        and result["failed"] == 0
+    )
 
 
 def run_model_sanity(
@@ -680,6 +692,26 @@ def run_model_sanity(
     stages = {st["kind"]: st for st in policy["tiers"]["model_sanity"]["stages"]}
     eval_stage = stages["evalscope"]
     dataset_spec = _resolve_dataset_spec(eval_stage["dataset"])
+    if (dataset_spec["id"], dataset_spec["subset_list"], dataset_spec["scoring"]) != (
+        "gsm8k",
+        ["main"],
+        "evalscope-default",
+    ):
+        raise ValueError("model_sanity supports only GSM8K main with EvalScope scoring")
+    dataset_options = {
+        key: dataset_spec[key]
+        for key in ("subset_list", "few_shot_num", "few_shot_random", "filters")
+    }
+    eval_seed = eval_stage["seed"]
+    eval_batch_size = eval_stage["eval_batch_size"]
+    if (
+        type(eval_seed) is not int
+        or type(eval_batch_size) is not int
+        or eval_batch_size <= 0
+    ):
+        raise ValueError(
+            "EvalScope requires an integer seed and a positive integer batch size"
+        )
 
     resolved = resolve_recipe(
         recipe_path,
@@ -740,6 +772,9 @@ def run_model_sanity(
             generation_config=gen_cfg,
             limit=limit if limit is not None else eval_stage.get("limit"),
             work_dir=eval_work_dir,
+            seed=eval_seed,
+            eval_batch_size=eval_batch_size,
+            dataset_options=dataset_options,
         )
         score, num = ppu_gsm8k_eval.extract_score(result_raw)
         eval_s = round(time.monotonic() - eval_t0, 3)
@@ -768,8 +803,26 @@ def run_model_sanity(
         )
         ok_cfg, cfg_err = accuracy_gate.check_generation_config(golden, gen_cfg)
         ok_acc, acc_err = accuracy_gate.check_accuracy_golden(score, num, golden)
-        acc_ok = ok_id and ok_cfg and ok_acc
-        acc_error = id_err or cfg_err or acc_err
+        ok_dataset = all(
+            golden["dataset"].get(key) == dataset_spec[key]
+            for key in (
+                "subset_list",
+                "few_shot_num",
+                "few_shot_random",
+                "num_expected",
+            )
+        )
+        acc_ok = ok_id and ok_cfg and ok_acc and ok_dataset
+        acc_error = (
+            id_err
+            or cfg_err
+            or acc_err
+            or (
+                None
+                if ok_dataset
+                else "Dataset sampling contract does not match golden"
+            )
+        )
 
         # 3. Drain & clear prefix cache on the SAME server before bench
         reset_before_bench = _drain_and_reset_cache(port)
@@ -791,42 +844,47 @@ def run_model_sanity(
                 raise KeyError(f"missing warmup/request count for concurrency {conc!r}")
             warmup_n = int(warmup_raw)
             req_n = int(req_raw)
-            _run_vllm_bench(
+            bench_kwargs = dict(
                 served_name=unique_served,
                 model_path=resolved["resolved_model"],
                 port=port,
                 concurrency=int(conc),
-                num_prompts=warmup_n,
                 input_len=int(bench_input["input_length"]),
                 output_len=int(bench_input["output_length"]),
                 range_ratio=float(bench_input.get("range_ratio", 0.0)),
                 trust_remote_code=trust_remote,
                 result_dir=bench_dir,
+            )
+            raw_warmup = _run_vllm_bench(
+                **bench_kwargs,
+                num_prompts=warmup_n,
                 result_filename=f"warmup_c{conc}.json",
             )
             _drain_and_reset_cache(port)
-            raw_bench = _run_vllm_bench(
-                served_name=unique_served,
-                model_path=resolved["resolved_model"],
-                port=port,
-                concurrency=int(conc),
-                num_prompts=req_n,
-                input_len=int(bench_input["input_length"]),
-                output_len=int(bench_input["output_length"]),
-                range_ratio=float(bench_input.get("range_ratio", 0.0)),
-                trust_remote_code=trust_remote,
-                result_dir=bench_dir,
-                result_filename=f"bench_c{conc}.json",
-            )
-            _drain_and_reset_cache(port)
+            raw_bench = None
+            failed_phase = "warmup"
+            if _bench_completed(raw_warmup, warmup_n):
+                raw_bench = _run_vllm_bench(
+                    **bench_kwargs,
+                    num_prompts=req_n,
+                    result_filename=f"bench_c{conc}.json",
+                )
+                _drain_and_reset_cache(port)
+                failed_phase = None if _bench_completed(raw_bench, req_n) else "measure"
             bench_results[f"c{conc}"] = {
                 "concurrency": int(conc),
                 "warmup_prompts": warmup_n,
                 "num_prompts": req_n,
                 "cache_mode": bench_stage.get("cache_mode", "sanity_throughput_guard"),
+                "status": "fail" if failed_phase else "pass",
+                "failed_phase": failed_phase,
+                "warmup_metrics": raw_warmup,
                 "metrics": raw_bench,
             }
         bench_s = round(time.monotonic() - bench_t0, 3)
+        bench_ok = bool(bench_results) and all(
+            result["status"] == "pass" for result in bench_results.values()
+        )
 
         golden_score = float(golden["score"])
         summary = {
@@ -835,10 +893,16 @@ def run_model_sanity(
             "hf_model_id": resolved["hf_model_id"],
             "golden_model_key": resolved["golden_model_key"],
             "preset": preset,
-            "status": "pass" if acc_ok else "fail",
+            "status": "pass" if acc_ok and bench_ok else "fail",
             "parser_checked": val_report["parser_checked"],
             "config_digest": resolved["config_digest"],
-            "dataset": {"id": dataset_spec["id"], "version": dataset_spec["version"]},
+            "dataset": {
+                "id": dataset_spec["id"],
+                "version": dataset_spec["version"],
+                **dataset_options,
+            },
+            "eval_seed": eval_seed,
+            "eval_batch_size": eval_batch_size,
             "timings": {
                 "queue_s": round(float(queue_s), 3),
                 "cold_start_s": cold_start_s,
@@ -861,7 +925,6 @@ def run_model_sanity(
             },
             "bench": bench_results,
         }
-        redact_and_verify_public_payload(summary, allow_loopback=True)
         (results_dir / "summary.json").write_text(
             json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
         )

@@ -195,6 +195,7 @@ jobs:
     needs: [runtime-image, build]
     if: >-
       ${{ !cancelled() &&
+      vars.PPU_RECIPE_PUBLIC_ENABLED == 'true' &&
       !inputs.skip_device_tests &&
       needs.runtime-image.result == 'success' &&
       (github.event_name != 'pull_request' ||
@@ -261,6 +262,7 @@ jobs:
           JOB_RESULTS: ${{ toJSON(needs) }}
           SKIP_PPU: ${{ inputs.skip_ppu }}
           SKIP_DEVICE_TESTS: ${{ inputs.skip_device_tests }}
+          RECIPE_PUBLIC_ENABLED: ${{ vars.PPU_RECIPE_PUBLIC_ENABLED }}
           EXISTING_BUILD_RUN_ID: ${{ inputs.existing_build_run_id || '' }}
           WHEEL_SOURCE_SHA: ${{ inputs.wheel_source_sha || '' }}
         run: |
@@ -296,6 +298,13 @@ jobs:
           for job in ("pin-unit-tests", "model-tests", "recipe-sanity", "upstream-reuse"):
               result = results.get(job, {}).get("result")
               if skip_device_tests and result == "skipped":
+                  continue
+              if (
+                  job == "recipe-sanity"
+                  and os.environ.get("RECIPE_PUBLIC_ENABLED") != "true"
+                  and result == "skipped"
+              ):
+                  print("recipe-sanity disabled: public output acceptance pending")
                   continue
               if (
                   job == "upstream-reuse"

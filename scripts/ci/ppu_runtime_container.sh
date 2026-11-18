@@ -326,14 +326,14 @@ case "${mode}" in
         )
         ;;
     recipe-sanity)
-        : "${PPU_CI_HF_HOME:?PPU_CI_HF_HOME is required for recipe-sanity}"
-        : "${PPU_CI_DG_CACHE_DIR:?PPU_CI_DG_CACHE_DIR is required for recipe-sanity}"
+        export PPU_CI_HF_HOME="${PPU_CI_HF_HOME:-/nas_aisw/datasets/hf_cache}"
+        dg_cache_path="${PPU_CI_DG_CACHE_DIR:-/nas_aisw/vllmci_dgcache}"
         : "${MODEL_ID:?MODEL_ID is required for recipe-sanity}"
         : "${RECIPE_PATH:?RECIPE_PATH is required for recipe-sanity}"
         : "${POLICY_PATH:?POLICY_PATH is required for recipe-sanity}"
         tier="${TIER:-fast_sanity}"
         hf_home=$(realpath "${PPU_CI_HF_HOME}")
-        dg_cache_root=$(realpath "${PPU_CI_DG_CACHE_DIR}")
+        dg_cache_root=$(realpath "${dg_cache_path}")
         [[ -d "${hf_home}" ]] || { echo "PPU_CI_HF_HOME is not a directory" >&2; exit 2; }
         [[ -d "${dg_cache_root}" ]] || { echo "PPU_CI_DG_CACHE_DIR is not a directory" >&2; exit 2; }
         model_snapshot=$(resolve_snapshot "${MODEL_ID}")
@@ -350,6 +350,7 @@ case "${mode}" in
             --env MODEL_ID="${MODEL_ID}"
             --env RECIPE_PATH="${RECIPE_PATH}"
             --env POLICY_PATH="${POLICY_PATH}"
+            --env PPU_RECIPE_SOURCE_SHA="${PPU_CI_SOURCE_SHA}"
             --env TIER="${tier}"
             --env PRESET="${PRESET:-}"
             --env LAYER_MODE="${LAYER_MODE:-auto}"
@@ -359,6 +360,9 @@ case "${mode}" in
             --env VLLM_USE_RUST_FRONTEND=0
             --env VLLM_USE_RUST_BENCH=0
         )
+        if [[ "${tier}" == "model_sanity" ]]; then
+            GSM8K_DATASET_PATH="${GSM8K_DATASET_PATH:-/nas_aisw/datasets/datasets/vision/EvalScope/data/gsm8k/v2/gsm8k}"
+        fi
         if [[ -n "${GSM8K_DATASET_PATH:-}" ]]; then
             gsm8k_dataset=$(realpath "${GSM8K_DATASET_PATH}")
             [[ -d "${gsm8k_dataset}" ]] || { echo "GSM8K_DATASET_PATH is not a directory" >&2; exit 2; }
@@ -376,4 +380,8 @@ case "${mode}" in
 esac
 
 "${create[@]}" 9>&- >"${artifact_dir}/container-id.txt"
-docker start --attach "${container}" 9>&- 2>&1 | tee "${artifact_dir}/runtime.log"
+if [[ "${mode}" == "recipe-sanity" ]]; then
+    (umask 077; docker start --attach "${container}" 9>&- >"${artifact_dir}/runtime.log" 2>&1)
+else
+    docker start --attach "${container}" 9>&- 2>&1 | tee "${artifact_dir}/runtime.log"
+fi

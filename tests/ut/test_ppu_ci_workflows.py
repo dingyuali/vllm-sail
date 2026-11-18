@@ -422,6 +422,7 @@ def test_pr_pipeline_structure():
         "JOB_RESULTS": "${{ toJSON(needs) }}",
         "SKIP_PPU": "${{ inputs.skip_ppu }}",
         "SKIP_DEVICE_TESTS": "${{ inputs.skip_device_tests }}",
+        "RECIPE_PUBLIC_ENABLED": "${{ vars.PPU_RECIPE_PUBLIC_ENABLED }}",
         "EXISTING_BUILD_RUN_ID": "${{ inputs.existing_build_run_id || '' }}",
         "WHEEL_SOURCE_SHA": "${{ inputs.wheel_source_sha || '' }}",
     }
@@ -1149,7 +1150,7 @@ def expression(value, context):
     """Evaluate only the Boolean/context subset used by these workflow guards."""
     value = value.removeprefix("${{").removesuffix("}}").strip()
     value = re.sub(
-        r"\b(?:inputs|github|needs|steps)(?:\.[\w*-]+)+",
+        r"\b(?:inputs|github|needs|steps|vars)(?:\.[\w*-]+)+",
         lambda match: repr(context.get(match[0])),
         value,
     )
@@ -1157,8 +1158,8 @@ def expression(value, context):
     value = value.replace("contains(", "contains_value(")
     value = value.replace("&&", " and ").replace("||", " or ")
     value = re.sub(r"!(?!=)", "not ", value)
-    value = re.sub(r"\btrue\b", "True", value)
-    value = re.sub(r"\bfalse\b", "False", value)
+    value = re.sub(r"(?<!['\"])\btrue\b(?!['\"])", "True", value)
+    value = re.sub(r"(?<!['\"])\bfalse\b(?!['\"])", "False", value)
 
     def contains_value(values, item):
         return item in values
@@ -1233,6 +1234,7 @@ def test_consumers_require_build_or_valid_reuse(build_jobs, build, run_id, sourc
         "needs.runtime-image.result": "success",
         "needs.runtime-image.outputs.upstream_reuse": "true",
         "needs.build.result": build,
+        "vars.PPU_RECIPE_PUBLIC_ENABLED": "true",
     }
     reuse = bool(run_id) and bool(source)
     eligible = build == "success" or (build == "skipped" and reuse)
@@ -1259,6 +1261,7 @@ def test_gate_executes_fail_closed_truth_table(
         "inputs.skip_device_tests": False,
         "inputs.existing_build_run_id": run_id,
         "inputs.wheel_source_sha": source,
+        "vars.PPU_RECIPE_PUBLIC_ENABLED": "true",
     }
     for key, value in step["env"].items():
         if key != "JOB_RESULTS":
@@ -1269,7 +1272,13 @@ def test_gate_executes_fail_closed_truth_table(
     results = {"runtime-image": {"result": "success"}}
     results.update(
         zip(
-            ("build", "pin-unit-tests", "model-tests", "recipe-sanity", "upstream-reuse"),
+            (
+                "build",
+                "pin-unit-tests",
+                "model-tests",
+                "recipe-sanity",
+                "upstream-reuse",
+            ),
             ({"result": state} for state in states),
             strict=False,
         )
@@ -1376,6 +1385,140 @@ def test_gate_accepts_skipped_reuse_only_without_the_entry_script(
         text=True,
     )
     assert (result.returncode == 0) is passed, result.stderr
+
+
+@pytest.mark.parametrize("enabled", ["", "false", "true"])
+def test_recipe_public_flag_controls_callers_and_gate(build_jobs, enabled):
+    context = {
+        "vars.PPU_RECIPE_PUBLIC_ENABLED": enabled,
+        "github.event_name": "workflow_dispatch",
+        "inputs.existing_build_run_id": "",
+        "inputs.wheel_source_sha": "",
+        "needs.runtime-image.result": "success",
+        "needs.build.result": "success",
+    }
+    manual = workflow("ppu-recipe-sanity.yaml")["jobs"]
+    leaf = workflow("_ppu-recipe-sanity.yaml")["jobs"]
+    for job in (
+        manual["build"],
+        manual["recipe-sanity"],
+        leaf["prepare"],
+        build_jobs["recipe-sanity"],
+    ):
+        assert bool(expression(job["if"], context)) == (enabled == "true")
+    assert manual["recipe-sanity"]["with"]["wheel_source_sha"] == "${{ github.sha }}"
+    assert manual["recipe-sanity"]["with"]["build_run_id"] == "${{ github.run_id }}"
+    gate = build_jobs["gate"]["steps"][0]["run"].replace(
+        "python - <<'PYTHON'", f"{sys.executable} - <<'PYTHON'"
+    )
+    results = {key: {"result": "success"} for key in build_jobs["gate"]["needs"]}
+    env = {
+        **os.environ,
+        "SKIP_PPU": "false",
+        "SKIP_DEVICE_TESTS": "false",
+        "EXISTING_BUILD_RUN_ID": "",
+        "WHEEL_SOURCE_SHA": "",
+        "RECIPE_PUBLIC_ENABLED": enabled,
+    }
+    for outcome in ("skipped", "success", "failure"):
+        results["recipe-sanity"]["result"] = outcome
+        result = subprocess.run(
+            ["bash", "-e", "-c", gate],
+            env={**env, "JOB_RESULTS": json.dumps(results)},
+            capture_output=True,
+            text=True,
+        )
+        assert (result.returncode == 0) == (
+            outcome == "success" or (outcome == "skipped" and enabled != "true")
+        )
+
+
+@pytest.mark.parametrize(
+    "pr_mode,tier,build_run,allowed",
+    [
+        ("false", "model_sanity", "101", True),
+        ("false", "model_sanity", "100", False),
+        ("false", "fast_sanity", "100", False),
+        ("true", "fast_sanity", "100", True),
+        ("true", "model_sanity", "101", False),
+    ],
+)
+def test_recipe_workflow_refuses_arbitrary_wheel_run(pr_mode, tier, build_run, allowed):
+    prepare = workflow("_ppu-recipe-sanity.yaml")["jobs"]["prepare"]
+    select = next(step for step in prepare["steps"] if step.get("id") == "select")
+    script = select["run"].partition("python3 scripts/ci/ppu_e2e_select.py")[0]
+    result = subprocess.run(
+        ["bash", "-e", "-c", script],
+        env={
+            **os.environ,
+            "TIER": tier,
+            "PR_MODE": pr_mode,
+            "BUILD_RUN_ID": build_run,
+            "GITHUB_RUN_ID": "101",
+        },
+    )
+    assert (result.returncode == 0) is allowed
+
+
+@pytest.mark.parametrize("exit_code,status", [(0, "pass"), (3, "fail")])
+def test_recipe_publication_excludes_raw_launcher_logs_and_results(
+    tmp_path, exit_code, status
+):
+    steps = workflow("_ppu-recipe-sanity.yaml")["jobs"]["sanity"]["steps"]
+    runtime = next(step for step in steps if step.get("id") == "recipe")
+    publish = next(step for step in steps if step.get("id") == "publish")
+    upload = next(
+        step for step in steps if step.get("uses") == "actions/upload-artifact@v4"
+    )
+    assert upload["with"]["path"] == "${{ steps.runtime.outputs.public }}/summary.json"
+    assert (
+        not {"PPU_CI_HF_HOME", "GSM8K_DATASET_PATH", "PPU_CI_DG_CACHE_DIR"}
+        & runtime["env"].keys()
+    )
+
+    launcher_path = tmp_path / "scripts/ci/ppu_runtime_container.sh"
+    launcher_path.parent.mkdir(parents=True)
+    launcher_path.write_text(
+        'echo "synthetic-private-stdout"\necho "synthetic-private-stderr" >&2\n'
+        'printf \'{"throughput":123,"path":"/private/model"}\' > "$PPU_CI_ARTIFACT_DIR/summary.json"\n'
+        f"exit {exit_code}\n"
+    )
+    private_dir, public_dir = tmp_path / "private", tmp_path / "public"
+    private_dir.mkdir()
+    public_dir.mkdir()
+    job_summary = tmp_path / "job-summary.md"
+    launch_result = subprocess.run(
+        ["bash", "-e", "-c", runtime["run"]],
+        env={
+            **os.environ,
+            "PPU_CI_SOURCE_DIR": str(tmp_path),
+            "PPU_CI_ARTIFACT_DIR": str(private_dir),
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert launch_result.returncode == exit_code
+    assert not launch_result.stdout and not launch_result.stderr
+    assert (private_dir / "launcher.log").read_text().splitlines() == [
+        "synthetic-private-stdout",
+        "synthetic-private-stderr",
+    ]
+    publish_result = subprocess.run(
+        ["bash", "-e", "-c", publish["run"]],
+        env={
+            **os.environ,
+            "RECIPE_OUTCOME": "failure" if exit_code else "success",
+            "PUBLIC_DIR": str(public_dir),
+            "GITHUB_STEP_SUMMARY": str(job_summary),
+        },
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert publish_result.stdout == f"Recipe sanity: {status}\n"
+    assert not publish_result.stderr
+    assert job_summary.read_text() == f"Recipe sanity: {status}\n"
+    assert json.loads((public_dir / "summary.json").read_text()) == {"status": status}
 
 
 def test_runtime_workflows_use_the_checked_in_docker_wrapper():

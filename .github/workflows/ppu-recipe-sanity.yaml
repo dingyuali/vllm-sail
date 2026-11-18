@@ -17,11 +17,6 @@ on:
         required: false
         default: glm-5.3,deepseek-v4-flash
         type: string
-      existing_build_run_id:
-        description: Optional existing ppu-wheels build run ID (blank builds from HEAD)
-        required: false
-        default: ""
-        type: string
 
 permissions:
   contents: read
@@ -31,7 +26,7 @@ cache-mode: none
 jobs:
   build:
     name: Build PPU wheels
-    if: (inputs.existing_build_run_id || '') == ''
+    if: vars.PPU_RECIPE_PUBLIC_ENABLED == 'true'
     uses: ./.github/workflows/_ppu-build.yaml
     with:
       pr_head_sha: ${{ github.sha }}
@@ -39,7 +34,9 @@ jobs:
   recipe-sanity:
     name: Recipe sanity
     needs: build
-    if: always() && (needs.build.result == 'success' || (needs.build.result == 'skipped' && (inputs.existing_build_run_id || '') != ''))
+    if: >-
+      ${{ !cancelled() && vars.PPU_RECIPE_PUBLIC_ENABLED == 'true' &&
+      needs.build.result == 'success' }}
     permissions:
       contents: read
       actions: read
@@ -47,7 +44,7 @@ jobs:
     with:
       pr_mode: false
       pr_head_sha: ${{ github.sha }}
-      wheel_source_sha: ${{ (inputs.existing_build_run_id || '') == '' && github.sha || '' }}
-      build_run_id: ${{ inputs.existing_build_run_id || github.run_id }}
+      wheel_source_sha: ${{ github.sha }}
+      build_run_id: ${{ github.run_id }}
       tier: ${{ inputs.tier }}
       models: ${{ inputs.models }}

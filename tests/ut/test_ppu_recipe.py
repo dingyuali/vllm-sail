@@ -375,9 +375,24 @@ def test_runner_fast_sanity_falls_back_from_2l_to_full_layers(
     assert (tmp_path / "out" / "summary.json").is_file()
 
 
-@pytest.mark.parametrize(("score", "status"), [(0.9689, "pass"), (0.9, "fail")])
+@pytest.mark.parametrize(
+    ("score", "failed_file", "counts", "failed_phase"),
+    [
+        (0.9689, None, {}, None),
+        (0.9, None, {}, None),
+        (0.9689, "bench_c16.json", {"completed": 0, "failed": 32}, "measure"),
+        (0.9689, "bench_c16.json", {"completed": 31, "failed": 1}, "measure"),
+        (0.9689, "bench_c16.json", {"completed": 32}, "measure"),
+        (0.9689, "warmup_c16.json", {"completed": 7, "failed": 1}, "warmup"),
+    ],
+)
 def test_runner_model_sanity_end_to_end_with_checked_in_policy(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, score: float, status: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    score: float,
+    failed_file: str | None,
+    counts: dict[str, int],
+    failed_phase: str | None,
 ) -> None:
     """Exercise run_model_sanity against checked-in GLM-5.3 recipe/policy and golden."""
     fake_proc = type("FakeProc", (), {"pid": 999999})()
@@ -411,8 +426,24 @@ def test_runner_model_sanity_end_to_end_with_checked_in_policy(
 
         @staticmethod
         def run_evalscope(
-            served_name, port, gsm8k_path, *, generation_config, limit, work_dir
+            served_name,
+            port,
+            gsm8k_path,
+            *,
+            generation_config,
+            limit,
+            work_dir,
+            seed,
+            eval_batch_size,
+            dataset_options,
         ):
+            assert (seed, eval_batch_size) == (42, 128)
+            assert dataset_options == {
+                "subset_list": ["main"],
+                "few_shot_num": 4,
+                "few_shot_random": False,
+                "filters": {"remove_until": "</think>"},
+            }
             _write_review(Path(work_dir), _review_fixture()[:2], model=served_name)
             return {"score": score, "num": 1319}
 
@@ -434,6 +465,11 @@ def test_runner_model_sanity_end_to_end_with_checked_in_policy(
     def fake_bench(**kw):
         bench_calls.append(kw)
         return {
+            **(
+                counts
+                if kw["result_filename"] == failed_file
+                else {"completed": kw["num_prompts"], "failed": 0}
+            ),
             "request_throughput": 12.5,
             "output_throughput": 420.0,
             "mean_ttft_ms": 80.0,
@@ -451,15 +487,17 @@ def test_runner_model_sanity_end_to_end_with_checked_in_policy(
         queue_s=1.5,
         post_ready_sleep=0,
     )
-    assert res["status"] == status
+    acc_ok = score == 0.9689
+    assert res["status"] == ("pass" if acc_ok and not failed_phase else "fail")
     assert res["accuracy"]["score"] == score
     assert res["accuracy"]["num"] == 1319
-    assert res["accuracy"]["within_band"] is (status == "pass")
+    assert res["accuracy"]["within_band"] is acc_ok
     assert res["accuracy"]["per_question"]["count"] == 2
     assert res["accuracy"]["per_question"]["status"] == "baseline_incomplete"
     assert set(res["bench"].keys()) == {"c1", "c16"}
-    assert [c["concurrency"] for c in bench_calls] == [1, 1, 16, 16]
-    assert [c["num_prompts"] for c in bench_calls] == [2, 8, 8, 32]
+    assert res["bench"]["c16"]["failed_phase"] == failed_phase
+    expected_prompts = [2, 8, 8] if failed_phase == "warmup" else [2, 8, 8, 32]
+    assert [c["num_prompts"] for c in bench_calls] == expected_prompts
     assert all(c["range_ratio"] == 0.0 for c in bench_calls)
     assert res["timings"]["queue_s"] == 1.5
     assert res["timings"]["cold_start_s"] == 12.34
