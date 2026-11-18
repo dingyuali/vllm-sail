@@ -5,6 +5,7 @@ import argparse
 import copy
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -602,6 +603,63 @@ def test_recipe_workflows_follow_security_and_shell_contracts() -> None:
     script = CI_DIR / "ppu_e2e_recipe_sanity.sh"
     res = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True)
     assert res.returncode == 0, res.stderr
+
+
+@pytest.mark.parametrize(
+    ("tier", "expected_install"),
+    [
+        ("model_sanity", True),
+        ("fast_sanity", False),
+    ],
+)
+def test_recipe_evalscope_install_preserves_runtime_numpy(
+    tmp_path: Path, tier: str, expected_install: bool
+) -> None:
+    script = (CI_DIR / "ppu_e2e_recipe_sanity.sh").read_text()
+    constraints = tmp_path / "constraints.txt"
+    constraints.write_text("torch===2.13.0\n")
+    python = tmp_path / "python"
+    python.write_text(
+        f"#!{sys.executable}\n"
+        "import os, sys\n"
+        "from pathlib import Path\n"
+        "if sys.argv[1] == '-c' and 'version(\"numpy\")' in sys.argv[2]:\n"
+        "    print('1.26.4')\n"
+        "elif sys.argv[1] == '-c':\n"
+        "    assert sys.argv[2] == 'from evalscope import TaskConfig, run_task'\n"
+        "    print('import evalscope')\n"
+        "else:\n"
+        "    assert sys.argv[1:4] == ['-m', 'pip', 'install']\n"
+        "    print(sys.argv[-1], Path(os.environ['PIP_CONSTRAINT']).read_text().split())\n"
+    )
+    python.chmod(0o755)
+    start = script.index('--constraints "${PIP_CONSTRAINT}"')
+    start = script.index("\n", start) + 1
+    end = script.index('python "${ROOT_DIR}/scripts/ci/ppu_image_stack.py" verify')
+    result = subprocess.run(
+        ["bash", "-euc", script[start:end]],
+        env={
+            "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"],
+            "PIP_CONSTRAINT": str(constraints),
+            "TIER": tier,
+            "ROOT_DIR": str(ROOT),
+            "vllm_wheel": "vllm.whl",
+            "sail_wheel": "sail.whl",
+        },
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    expected = ["torch===2.13.0"]
+    if expected_install:
+        expected.extend(["numpy===1.26.4", "pyarrow<26"])
+    packages = ["vllm.whl", "sail.whl", str(ROOT / "requirements/ci-runtime.txt")]
+    if expected_install:
+        packages.append("evalscope==1.14.1")
+    expected_output = [f"{package} {expected}" for package in packages]
+    if expected_install:
+        expected_output.append("import evalscope")
+    assert result.stdout.splitlines() == expected_output
 
 
 def test_prediction_only_file_cannot_supply_baseline(tmp_path: Path) -> None:

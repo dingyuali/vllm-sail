@@ -127,6 +127,10 @@ export PIP_CONSTRAINT="/tmp/ppu-recipe-image-constraints.txt"
 python "${ROOT_DIR}/scripts/ci/ppu_image_stack.py" capture \
     --sdk /usr/local/PPU_SDK --output "/tmp/ppu-recipe-image-stack.json" \
     --constraints "${PIP_CONSTRAINT}"
+if [[ "${TIER}" == "model_sanity" ]]; then
+    numpy_version="$(python -c 'from importlib.metadata import version; print(version("numpy"))')"
+    printf 'numpy===%s\npyarrow<26\n' "${numpy_version}" >> "${PIP_CONSTRAINT}"
+fi
 
 python -m pip install --no-deps --force-reinstall "${vllm_wheel}"
 python -m pip install --no-deps --force-reinstall "${sail_wheel}"
@@ -135,6 +139,7 @@ PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
 if [[ "${TIER}" == "model_sanity" ]]; then
     PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
         python -m pip install "evalscope==1.14.1"
+    python -c 'from evalscope import TaskConfig, run_task'
 fi
 
 python "${ROOT_DIR}/scripts/ci/ppu_image_stack.py" verify \
