@@ -491,7 +491,11 @@ def test_runner_model_sanity_end_to_end_with_checked_in_policy(
     assert res["status"] == ("pass" if acc_ok and not failed_phase else "fail")
     assert res["accuracy"]["score"] == score
     assert res["accuracy"]["num"] == 1319
+    assert res["accuracy"]["expected_num"] == 1319
+    assert res["accuracy"]["minimum_score"] == pytest.approx(0.9489)
+    assert res["accuracy"]["maximum_score"] == pytest.approx(0.9889)
     assert res["accuracy"]["within_band"] is acc_ok
+    assert res["micro_e2e_passed"] is (failed_phase is None)
     assert res["accuracy"]["per_question"]["count"] == 2
     assert res["accuracy"]["per_question"]["status"] == "baseline_incomplete"
     assert set(res["bench"].keys()) == {"c1", "c16"}

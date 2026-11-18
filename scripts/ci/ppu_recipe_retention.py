@@ -7,8 +7,8 @@ import stat
 import tempfile
 from pathlib import Path
 
-REQUIRED_FILES = ("summary.json", "provenance.json", "launcher.log")
-OPTIONAL_FILE = "gsm8k_per_question.jsonl"
+REQUIRED_FILES = ("results/summary.json", "provenance.json", "launcher.log")
+OPTIONAL_FILE = "results/gsm8k_per_question.jsonl"
 
 
 def _check_private_dir(directory: Path) -> None:
@@ -58,17 +58,20 @@ def retain(environ) -> None:
         raise FileExistsError("retention destination already exists")
 
     source_dir = Path(environ["PPU_CI_ARTIFACT_DIR"])
+    if not stat.S_ISDIR((source_dir / "results").lstat().st_mode):
+        raise ValueError("expected a recipe results directory")
     with tempfile.TemporaryDirectory(prefix=".staging-", dir=parent) as staging_dir:
         staging = Path(staging_dir)
         published = staging / index["model_key"]
         published.mkdir(mode=0o700)
         files = {}
-        for name in (*REQUIRED_FILES, OPTIONAL_FILE):
-            source = source_dir / name
+        for relative_path in (*REQUIRED_FILES, OPTIONAL_FILE):
+            source = source_dir / relative_path
+            name = source.name
             try:
                 mode = source.lstat().st_mode
             except FileNotFoundError:
-                if name == OPTIONAL_FILE:
+                if relative_path == OPTIONAL_FILE:
                     continue
                 raise
             if not stat.S_ISREG(mode):
@@ -102,11 +105,8 @@ def main() -> int:
             exit_code = 1
         else:
             status = "retained"
-    elif os.environ.get("TIER") == "fast_sanity":
-        print("::warning::private results retention not configured")
     else:
-        print("::error::private results retention not configured")
-        exit_code = 1
+        print("::warning::private results retention not configured")
 
     with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as outputs:
         outputs.write(f"retention={status}\n")

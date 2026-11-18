@@ -1610,9 +1610,17 @@ def test_recipe_workflow_refuses_arbitrary_wheel_run(
 @pytest.mark.parametrize("exit_code,status", [(0, "pass"), (3, "fail")])
 @pytest.mark.parametrize(
     "retention_case",
-    ["configured", "unset", "copy_error", "retry", "unsafe_source", "ephemeral"],
+    [
+        "configured",
+        "unset",
+        "empty",
+        "copy_error",
+        "retry",
+        "unsafe_source",
+        "ephemeral",
+    ],
 )
-def test_recipe_retention_and_status_only_publication(
+def test_recipe_retention_and_publication(
     tmp_path, leaf_name, tier, exit_code, status, retention_case
 ):
     steps = workflow(leaf_name)["jobs"]["sanity"]["steps"]
@@ -1638,8 +1646,8 @@ def test_recipe_retention_and_status_only_publication(
     launcher_path.parent.mkdir(parents=True)
     launcher_path.write_text(
         'echo "synthetic-private-stdout"\necho "synthetic-private-stderr" >&2\n'
-        'printf \'{"throughput":123,"path":"%s"}\' "$FAKE_SENSITIVE_ROOT" '
-        '> "$PPU_CI_ARTIFACT_DIR/summary.json"\n'
+        'mkdir "$PPU_CI_ARTIFACT_DIR/results"\n'
+        'printf "%s\\n" "$FAKE_PRIVATE_SUMMARY" > "$PPU_CI_ARTIFACT_DIR/results/summary.json"\n'
         f"exit {exit_code}\n"
     )
     private_dir, public_dir = tmp_path / "private", tmp_path / "public"
@@ -1662,13 +1670,32 @@ def test_recipe_retention_and_status_only_publication(
             directory.mkdir(mode=0o700)
         (retained_dir / "index.json").write_text("original index")
     job_summary = tmp_path / "job-summary.md"
+    private_summary = {
+        "path": str(retention_root),
+        "accuracy": {
+            "score": 0.96,
+            "num": 1319,
+            "expected_num": 1319,
+            "golden_score": 0.97,
+            "minimum_score": 0.95,
+            "maximum_score": 0.99,
+            "within_band": True,
+            "error": "synthetic-private-error",
+            "per_question": {
+                "status": "baseline_established",
+                "source_file": "synthetic-private-review.jsonl",
+            },
+        },
+        "micro_e2e_passed": exit_code == 0,
+        "bench": {"c1": {"status": "synthetic-private-bench"}},
+    }
     launch_result = subprocess.run(
         ["bash", "-e", "-c", runtime["run"]],
         env={
             **os.environ,
             "PPU_CI_SOURCE_DIR": str(tmp_path),
             "PPU_CI_ARTIFACT_DIR": str(private_dir),
-            "FAKE_SENSITIVE_ROOT": str(retention_root),
+            "FAKE_PRIVATE_SUMMARY": json.dumps(private_summary),
         },
         capture_output=True,
         text=True,
@@ -1679,26 +1706,37 @@ def test_recipe_retention_and_status_only_publication(
         "synthetic-private-stdout",
         "synthetic-private-stderr",
     ]
+    results_dir = private_dir / "results"
     if retention_case == "unsafe_source":
-        (private_dir / "provenance.json").symlink_to(private_dir / "summary.json")
+        (private_dir / "provenance.json").symlink_to(results_dir / "summary.json")
     elif retention_case != "copy_error":
         (private_dir / "provenance.json").write_text("private provenance")
-    filenames = {"summary.json", "provenance.json", "launcher.log"}
+    retained_sources = {
+        "summary.json": results_dir / "summary.json",
+        "provenance.json": private_dir / "provenance.json",
+        "launcher.log": private_dir / "launcher.log",
+    }
     if tier == "model_sanity":
-        filenames.add("gsm8k_per_question.jsonl")
-        (private_dir / "gsm8k_per_question.jsonl").write_text("private scores")
+        per_question = results_dir / "gsm8k_per_question.jsonl"
+        per_question.write_text("private scores")
+        retained_sources[per_question.name] = per_question
+    (private_dir / "summary.json").write_text('{"accuracy":{"score":0.01}}')
     (private_dir / "runtime.log").write_text("not on the retention allowlist")
     outputs = tmp_path / "retention-output"
+    retention_env = os.environ.copy()
+    if retention_case == "unset":
+        retention_env.pop("PPU_CI_PRIVATE_RESULTS_ROOT", None)
+    else:
+        retention_env["PPU_CI_PRIVATE_RESULTS_ROOT"] = (
+            "" if retention_case == "empty" else str(retention_root)
+        )
     retain_result = subprocess.run(
         ["bash", "-e", "-c", retain["run"]],
         env={
-            **os.environ,
+            **retention_env,
             "PPU_CI_SOURCE_DIR": str(ROOT),
             "PPU_CI_SOURCE_SHA": "a" * 40,
             "PPU_CI_ARTIFACT_DIR": str(private_dir),
-            "PPU_CI_PRIVATE_RESULTS_ROOT": (
-                "" if retention_case == "unset" else str(retention_root)
-            ),
             "TIER": tier,
             "MODEL_KEY": "glm-5.3",
             "RUNNER_TEMP": str(runner_temp),
@@ -1710,21 +1748,20 @@ def test_recipe_retention_and_status_only_publication(
         capture_output=True,
         text=True,
     )
-    expected_retention = {"configured": "retained", "unset": "not_configured"}.get(
-        retention_case, "failed"
-    )
+    expected_retention = {
+        "configured": "retained",
+        "unset": "not_configured",
+        "empty": "not_configured",
+    }.get(retention_case, "failed")
     retention = outputs.read_text().removeprefix("retention=").strip()
     assert retention == expected_retention
-    expected_error = not (
-        retention_case == "configured"
-        or (retention_case == "unset" and tier == "fast_sanity")
-    )
+    expected_error = expected_retention == "failed"
     assert retain_result.returncode == int(expected_error)
     assert retain_result.stderr == ""
     if retention_case == "configured":
-        assert {file.name for file in retained_dir.iterdir()} == filenames | {
-            "index.json"
-        }
+        assert {
+            file.name for file in retained_dir.iterdir()
+        } == retained_sources.keys() | {"index.json"}
         assert json.loads((retained_dir / "index.json").read_text()) == {
             "checkout_sha": "a" * 40,
             "tier": tier,
@@ -1732,27 +1769,25 @@ def test_recipe_retention_and_status_only_publication(
             "run_id": "101",
             "attempt": "2",
             "files": {
-                name: hashlib.sha256((private_dir / name).read_bytes()).hexdigest()
-                for name in filenames
+                name: hashlib.sha256(source.read_bytes()).hexdigest()
+                for name, source in retained_sources.items()
             },
         }
         for entry in retention_root.rglob("*"):
             assert stat.S_IMODE(entry.stat().st_mode) == (
                 0o700 if entry.is_dir() else 0o600
             )
-        for name in filenames:
-            assert (retained_dir / name).read_bytes() == (
-                private_dir / name
-            ).read_bytes()
+        for name, source in retained_sources.items():
+            assert (retained_dir / name).read_bytes() == source.read_bytes()
     elif retention_case == "retry":
         assert (retained_dir / "index.json").read_text() == "original index"
     else:
         assert not retained_dir.exists()
     assert not list(retention_root.rglob(".staging-*"))
-    if retention_case == "unset":
-        sev = "error" if expected_error else "warning"
-        assert retain_result.stdout == (
-            f"::{sev}::private results retention not configured\n"
+    if expected_retention == "not_configured":
+        assert (
+            retain_result.stdout
+            == "::warning::private results retention not configured\n"
         )
     else:
         assert retain_result.stdout == ""
@@ -1764,6 +1799,8 @@ def test_recipe_retention_and_status_only_publication(
             "RECIPE_OUTCOME": "failure" if exit_code else "success",
             "RETENTION_OUTCOME": "failure" if retain_result.returncode else "success",
             "RETENTION": retention,
+            "MODEL_KEY": "glm-5.3",
+            "PRIVATE_DIR": str(private_dir),
             "PUBLIC_DIR": str(public_dir),
             "GITHUB_STEP_SUMMARY": str(job_summary),
         },
@@ -1776,8 +1813,32 @@ def test_recipe_retention_and_status_only_publication(
     public_summary = (public_dir / "summary.json").read_text()
     assert publish_result.stdout == f"Recipe sanity: {status}\nretention: {retention}\n"
     assert not publish_result.stderr
-    assert job_summary.read_text() == publish_result.stdout
-    assert json.loads(public_summary) == {"status": status, "retention": retention}
+    expected_public = {"status": status, "retention": retention}
+    if tier == "model_sanity":
+        micro_e2e = "fail" if exit_code else "pass"
+        expected_public.update(
+            model_key="glm-5.3",
+            gsm8k={
+                "score": 0.96,
+                "evaluated_samples": 1319,
+                "expected_samples": 1319,
+                "golden_score": 0.97,
+                "minimum_score": 0.95,
+                "maximum_score": 0.99,
+                "gate": "pass",
+            },
+            baseline_completeness="baseline_established",
+            micro_e2e=micro_e2e,
+        )
+        assert f"**Result:** {status}" in job_summary.read_text()
+        assert f"**Private retention:** {retention}" in job_summary.read_text()
+        assert "96.00% (golden: 97.00%)" in job_summary.read_text()
+        assert "1319 / 1319" in job_summary.read_text()
+        assert "min: 95.00%, max: 99.00%" in job_summary.read_text()
+        assert f"**Micro-E2E:** {micro_e2e}" in job_summary.read_text()
+    else:
+        assert job_summary.read_text() == publish_result.stdout
+    assert json.loads(public_summary) == expected_public
     for public_output in (
         retain_result.stdout + retain_result.stderr + publish_result.stdout,
         job_summary.read_text(),
@@ -1785,6 +1846,58 @@ def test_recipe_retention_and_status_only_publication(
     ):
         assert str(retention_root) not in public_output
         assert "mock-intranet-retention" not in public_output
+        assert "synthetic-private-" not in public_output
+
+
+@pytest.mark.parametrize(
+    "private_summary",
+    [
+        None,
+        b'{"token":"synthetic-private-value"',
+        b"\xffsynthetic-private-value",
+        b'{"accuracy":{"score":NaN,"num":true,"expected_num":1319.5,'
+        b'"within_band":"pass","golden_score":"synthetic-private-value",'
+        b'"per_question":{"status":"synthetic-private-value"}},'
+        b'"micro_e2e_passed":"pass"}',
+    ],
+)
+def test_nightly_public_summary_drops_missing_and_unsafe_metrics(
+    tmp_path, private_summary
+):
+    steps = workflow("_ppu-recipe-model-sanity.yaml")["jobs"]["sanity"]["steps"]
+    publish = next(step for step in steps if step.get("id") == "publish")
+    private_dir = tmp_path / "private"
+    results_dir = private_dir / "results"
+    results_dir.mkdir(parents=True)
+    if private_summary is not None:
+        (results_dir / "summary.json").write_bytes(private_summary)
+    job_summary = tmp_path / "job-summary.md"
+    result = subprocess.run(
+        ["bash", "-e", "-c", publish["run"]],
+        env={
+            **os.environ,
+            "RECIPE_OUTCOME": "failure",
+            "RETENTION_OUTCOME": "failure",
+            "RETENTION": "failed",
+            "MODEL_KEY": "deepseek-v4-flash",
+            "PRIVATE_DIR": str(private_dir),
+            "PUBLIC_DIR": str(tmp_path),
+            "GITHUB_STEP_SUMMARY": str(job_summary),
+        },
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    public_summary = (tmp_path / "summary.json").read_text()
+    public = json.loads(public_summary)
+    assert public["status"] == "fail"
+    assert public["model_key"] == "deepseek-v4-flash"
+    assert public["micro_e2e"] == public["baseline_completeness"] == "not_available"
+    assert public["gsm8k"].pop("gate") == "not_available"
+    assert all(value is None for value in public["gsm8k"].values())
+    assert "synthetic-private-value" not in (
+        result.stdout + result.stderr + job_summary.read_text() + public_summary
+    )
 
 
 def test_runtime_workflows_use_the_checked_in_docker_wrapper():

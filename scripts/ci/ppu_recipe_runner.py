@@ -887,6 +887,7 @@ def run_model_sanity(
         )
 
         golden_score = float(golden["score"])
+        minimum_score, maximum_score = accuracy_gate.golden_score_bounds(golden)
         summary = {
             "tier": "model_sanity",
             "model_id": policy["model_id"],
@@ -913,7 +914,10 @@ def run_model_sanity(
             "accuracy": {
                 "score": score,
                 "num": num,
+                "expected_num": golden["dataset"].get("num_expected"),
                 "golden_score": golden_score,
+                "minimum_score": minimum_score,
+                "maximum_score": maximum_score,
                 "delta": round(score - golden_score, 6),
                 "within_band": acc_ok,
                 "error": acc_error,
@@ -923,6 +927,7 @@ def run_model_sanity(
                 **reset_before_bench,
                 "prior_workload_ids": ["sanity", "eval-gsm8k"],
             },
+            "micro_e2e_passed": bench_ok,
             "bench": bench_results,
         }
         (results_dir / "summary.json").write_text(

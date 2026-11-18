@@ -177,13 +177,15 @@ jobs:
           umask 077
           python3 -I "${PPU_CI_SOURCE_DIR}/scripts/ci/ppu_recipe_retention.py"
 
-      - name: Publish recipe sanity status
+      - name: Publish public recipe sanity summary
         id: publish
         if: always() && steps.runtime.outcome == 'success'
         env:
           RECIPE_OUTCOME: ${{ steps.recipe.outcome }}
           RETENTION_OUTCOME: ${{ steps.retain.outcome }}
           RETENTION: ${{ steps.retain.outputs.retention }}
+          MODEL_KEY: ${{ matrix.model.key }}
+          PRIVATE_DIR: ${{ steps.runtime.outputs.artifacts }}
           PUBLIC_DIR: ${{ steps.runtime.outputs.public }}
         run: |
           case "$RECIPE_OUTCOME" in
@@ -196,10 +198,83 @@ jobs:
             retained|not_configured|failed) retention="$RETENTION" ;;
             *) retention=failed ;;
           esac
-          printf 'Recipe sanity: %s\nretention: %s\n' "$status" "$retention" | tee -a "$GITHUB_STEP_SUMMARY"
-          printf '{"status":"%s","retention":"%s"}\n' "$status" "$retention" > "$PUBLIC_DIR/summary.json"
+          printf 'Recipe sanity: %s\nretention: %s\n' "$status" "$retention"
+          python3 -I - "$status" "$retention" <<'PY'
+          import json
+          import os
+          import re
+          import stat
+          import sys
+          from pathlib import Path
 
-      - name: Upload recipe sanity status
+          def mapping(value):
+              return value if isinstance(value, dict) else {}
+
+          def number(value, low, high):
+              return value if type(value) in (int, float) and low <= value <= high else None
+
+          def count(value):
+              return value if type(value) is int and 0 <= value <= 1_000_000 else None
+
+          def verdict(value):
+              return {True: "pass", False: "fail"}[value] if type(value) is bool else "not_available"
+
+          def percent(value):
+              return f"{value:.2%}" if value is not None else "—"
+
+          def display_count(value):
+              return value if value is not None else "—"
+
+          source = Path(os.environ["PRIVATE_DIR"]) / "results" / "summary.json"
+          private = {}
+          try:
+              if stat.S_ISDIR(source.parent.lstat().st_mode):
+                  info = source.lstat()
+                  if stat.S_ISREG(info.st_mode) and info.st_size <= 1024 * 1024:
+                      private = mapping(json.loads(source.read_text(encoding="utf-8")))
+          except (OSError, ValueError, RecursionError):
+              pass
+          accuracy = mapping(private.get("accuracy"))
+          baseline = mapping(accuracy.get("per_question")).get("status")
+          model = os.environ["MODEL_KEY"]
+          if baseline not in ("baseline_established", "baseline_incomplete"):
+              baseline = "not_available"
+          public = {
+              "model_key": model if re.fullmatch(r"[a-z0-9][a-z0-9.-]{0,63}", model) else None,
+              "status": sys.argv[1],
+              "retention": sys.argv[2],
+              "gsm8k": {
+                  "score": number(accuracy.get("score"), 0, 1),
+                  "evaluated_samples": count(accuracy.get("num")),
+                  "expected_samples": count(accuracy.get("expected_num")),
+                  "golden_score": number(accuracy.get("golden_score"), 0, 1),
+                  "minimum_score": number(accuracy.get("minimum_score"), -1, 2),
+                  "maximum_score": number(accuracy.get("maximum_score"), -1, 2),
+                  "gate": verdict(accuracy.get("within_band")),
+              },
+              "baseline_completeness": baseline,
+              "micro_e2e": verdict(private.get("micro_e2e_passed")),
+          }
+          (Path(os.environ["PUBLIC_DIR"]) / "summary.json").write_text(
+              json.dumps(public, indent=2, allow_nan=False) + "\n", encoding="utf-8"
+          )
+          gsm8k = public["gsm8k"]
+          summary = [
+              f"### Recipe model sanity: {public['model_key'] or 'unknown model'}",
+              "",
+              f"- **Result:** {public['status']} · **Private retention:** {public['retention']}",
+              f"- **GSM8K accuracy:** {percent(gsm8k['score'])} (golden: {percent(gsm8k['golden_score'])})",
+              "- **GSM8K samples (evaluated / expected):** "
+              f"{display_count(gsm8k['evaluated_samples'])} / {display_count(gsm8k['expected_samples'])}",
+              f"- **GSM8K gate:** {gsm8k['gate']} (min: {percent(gsm8k['minimum_score'])}, max: {percent(gsm8k['maximum_score'])})",
+              f"- **Micro-E2E:** {public['micro_e2e']}",
+              f"- **Per-question baseline completeness:** {public['baseline_completeness']}",
+          ]
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as output:
+              output.write("\n".join(summary) + "\n")
+          PY
+
+      - name: Upload public recipe sanity summary
         if: always() && steps.publish.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:

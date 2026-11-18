@@ -118,11 +118,16 @@ Set an operator-managed cleanup policy based on the baseline comparison window
 and available space; remove expired run attempts and abandoned staging directories
 only when no writer is active.
 
-The public console, step summary, and artifact expose only the recipe outcome
-and a retention status (`retained`, `not_configured`, or `failed`). An unset
-variable warns in `fast_sanity` and fails `model_sanity`; a configured copy
-failure fails either job. `retained` confirms the private files were saved, not
-that the run established a complete or comparable GSM8K baseline.
+The public console reports the recipe outcome and retention status (`retained`,
+`not_configured`, or `failed`). The nightly job summary and downloadable
+artifact also report aggregate GSM8K accuracy, sample counts, golden score,
+gate bounds and verdict, micro-E2E verdict, and baseline completeness. They
+never include raw results, per-question scores, provenance, or logs. Metrics
+that were not produced are reported as unavailable. An unset or empty variable
+warns in either tier without changing the recipe verdict; no private baseline
+is retained for that run. A configured copy failure still fails either job.
+Public upload does not replace private retention. `retained` confirms a
+private copy, not a complete or comparable GSM8K baseline.
 
 ### Upstream test reuse
 
