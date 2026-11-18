@@ -558,7 +558,7 @@ def test_recipe_workflows_follow_security_and_shell_contracts() -> None:
         "_ppu-recipe-fast-sanity.yaml",
         "ppu-recipe-fast-sanity.yaml",
         "_ppu-recipe-model-sanity.yaml",
-        "ppu-recipe-model-sanity-nightly.yaml",
+        "ppu-accuracy-nightly.yaml",
     ):
         wf = yaml.safe_load((ROOT / ".github" / "workflows" / wf_name).read_text())
         assert wf["cache-mode"] == "none"

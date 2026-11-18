@@ -1396,18 +1396,17 @@ def test_recipe_public_flag_controls_callers_and_gate(build_jobs, enabled):
         "inputs.wheel_source_sha": "",
         "needs.runtime-image.result": "success",
         "needs.build.result": "success",
+        "needs.select.result": "success",
+        "needs.select.outputs.recipe_models": "glm-5.3",
     }
     fast_manual = workflow("ppu-recipe-fast-sanity.yaml")["jobs"]
     fast_leaf = workflow("_ppu-recipe-fast-sanity.yaml")["jobs"]
-    model_nightly = workflow("ppu-recipe-model-sanity-nightly.yaml")["jobs"]
     model_leaf = workflow("_ppu-recipe-model-sanity.yaml")["jobs"]
     accuracy_nightly = workflow("ppu-accuracy-nightly.yaml")["jobs"]
     for job in (
         fast_manual["build"],
         fast_manual["recipe-fast-sanity"],
         fast_leaf["prepare"],
-        model_nightly["build"],
-        model_nightly["recipe-model-sanity"],
         model_leaf["prepare"],
         accuracy_nightly["recipe-model-sanity"],
         build_jobs["recipe-sanity"],
@@ -1422,11 +1421,11 @@ def test_recipe_public_flag_controls_callers_and_gate(build_jobs, enabled):
         == "${{ github.run_id }}"
     )
     assert (
-        model_nightly["recipe-model-sanity"]["with"]["wheel_source_sha"]
+        accuracy_nightly["recipe-model-sanity"]["with"]["wheel_source_sha"]
         == "${{ github.sha }}"
     )
     assert (
-        model_nightly["recipe-model-sanity"]["with"]["build_run_id"]
+        accuracy_nightly["recipe-model-sanity"]["with"]["build_run_id"]
         == "${{ github.run_id }}"
     )
     gate = build_jobs["gate"]["steps"][0]["run"].replace(
@@ -1452,6 +1451,122 @@ def test_recipe_public_flag_controls_callers_and_gate(build_jobs, enabled):
         assert (result.returncode == 0) == (
             outcome == "success" or (outcome == "skipped" and enabled != "true")
         )
+
+
+def test_recipe_model_sanity_has_one_scheduled_entry():
+    callers = []
+    for path in WORKFLOWS.iterdir():
+        if path.suffix not in {".yaml", ".yml"}:
+            continue
+        config = workflow(path.name)
+        if "schedule" not in config[True]:
+            continue
+        if any(
+            job.get("uses") == "./.github/workflows/_ppu-recipe-model-sanity.yaml"
+            for job in config["jobs"].values()
+        ):
+            callers.append(path.name)
+    assert callers == ["ppu-accuracy-nightly.yaml"]
+
+
+@pytest.mark.parametrize(
+    "event,models,enabled,legacy_cases,recipe_slugs,error",
+    [
+        ("schedule", "", "true", None, "", ""),
+        ("schedule", "", "false", None, None, ""),
+        ("workflow_dispatch", "", "true", None, None, ""),
+        (
+            "workflow_dispatch",
+            "glm-5.3-mxfp4-tp4",
+            "true",
+            ["glm-5.3-mxfp4-tp4"],
+            None,
+            "",
+        ),
+        (
+            "workflow_dispatch",
+            "recipe:glm-5.3, deepseek-v4-flash",
+            "true",
+            [],
+            "glm-5.3,deepseek-v4-flash",
+            "",
+        ),
+        (
+            "workflow_dispatch",
+            "recipe:glm-5.3",
+            "",
+            [],
+            None,
+            "Recipe accuracy is disabled",
+        ),
+        (
+            "workflow_dispatch",
+            "recipe: ,",
+            "true",
+            [],
+            None,
+            "nonempty Recipe policy slugs",
+        ),
+        ("workflow_dispatch", "recipe:glm-5.3,glm-5.3", "true", [], None, "distinct"),
+        (
+            "workflow_dispatch",
+            "recipe:typo",
+            "true",
+            [],
+            None,
+            "unknown recipe policy key",
+        ),
+    ],
+)
+def test_accuracy_nightly_routes_selected_models(
+    tmp_path, event, models, enabled, legacy_cases, recipe_slugs, error
+):
+    jobs = workflow("ppu-accuracy-nightly.yaml")["jobs"]
+    selector = next(
+        step for step in jobs["select"]["steps"] if step.get("id") == "select"
+    )
+    output = tmp_path / "github-output"
+    script = selector["run"].replace("python3 -", f'"{sys.executable}" -', 1)
+    result = subprocess.run(
+        ["bash", "-e", "-c", script],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "MODELS": models,
+            "RECIPE_PUBLIC_ENABLED": enabled,
+            "GITHUB_OUTPUT": str(output),
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert jobs["build"]["needs"] == "select"
+    if error:
+        assert result.returncode != 0 and error in result.stderr
+        assert not output.exists()
+        return
+    assert result.returncode == 0, result.stderr
+    values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    legacy_matrix = values.get("matrix", "")
+    context = {
+        "github.event_name": event,
+        "vars.PPU_RECIPE_PUBLIC_ENABLED": enabled,
+        "needs.build.result": "success",
+        "needs.select.result": "success",
+        "needs.select.outputs.recipe_models": values.get("recipe_models", ""),
+        "needs.select.outputs.matrix": legacy_matrix,
+    }
+    assert expression(jobs["accuracy"]["if"], context) == (legacy_cases != [])
+    if legacy_cases is None:
+        assert len(json.loads(legacy_matrix)["include"]) > 1
+    elif legacy_cases:
+        assert [
+            entry["model"] for entry in json.loads(legacy_matrix)["include"]
+        ] == legacy_cases
+    recipe = jobs["recipe-model-sanity"]
+    assert "accuracy" in recipe["needs"]
+    assert bool(expression(recipe["if"], context)) == (recipe_slugs is not None)
+    assert recipe["with"]["models"] == "${{ needs.select.outputs.recipe_models }}"
+    assert values.get("recipe_models", "") == (recipe_slugs or "")
 
 
 @pytest.mark.parametrize(
