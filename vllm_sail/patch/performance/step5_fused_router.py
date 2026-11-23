@@ -108,7 +108,9 @@ def install() -> None:
 
     _install_independent_topk()
     fuse_router = envs.VLLM_SAIL_STEP5_FUSED_ROUTER
-    optimize_dispatch = envs.VLLM_SAIL_STEP5_MEGA_MOE_OVERLAP
+    optimize_dispatch = (
+        envs.VLLM_SAIL_STEP5_MEGA_MOE_OVERLAP or envs.VLLM_SAIL_MEGA_MOE_ULTRA_EP
+    )
     if not (fuse_router or optimize_dispatch):
         _installed = True
         return
@@ -194,8 +196,9 @@ def install() -> None:
             and router.top_k == 8
             and router.capture_fn is None
         )
-        dispatch_enabled = optimize_dispatch and mega_moe_dispatch.can_overlap(
-            self, hidden_states
+        dispatch_enabled = optimize_dispatch and (
+            routed_experts.ultra_ep is not None
+            or mega_moe_dispatch.can_overlap(self, hidden_states)
         )
         if not fused and not dispatch_enabled:
             return original_forward(self, hidden_states, padding)

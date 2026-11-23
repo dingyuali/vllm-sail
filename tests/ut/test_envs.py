@@ -16,6 +16,7 @@ from vllm_sail import envs
 
 BOOL_DEFAULTS = {
     "STEP5_MEGA_MOE_OVERLAP": True,
+    "MEGA_MOE_ULTRA_EP": False,
     "FUSED_RMSNORM_QUANT": False,
     "USE_OPT_TOKEN_GROUP_QUANT": False,
     "DENSE_BF16_DEEPGEMM": False,
@@ -49,6 +50,8 @@ BOOL_DEFAULTS = {
     "PPU_KV_NVFP4": False,
 }
 INT_DEFAULTS = {
+    "MEGA_MOE_ULTRA_EP_MIN_TOKENS": 256,
+    "MEGA_MOE_ULTRA_EP_REDUNDANT_EXPERTS": 2,
     "KPOOL_MAX_DENSE_POOLS": 1 << 21,
     "STEP5_DSA_SCORE_MAX_BYTES": 1 << 30,
 }

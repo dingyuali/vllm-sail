@@ -46,6 +46,9 @@ if TYPE_CHECKING:
     VLLM_SAIL_ENABLE_MOE_MARLIN: bool = False
     VLLM_SAIL_MEGA_MOE_MMA_TYPE: str = "fp8xmxfp4"
     VLLM_SAIL_STEP5_MEGA_MOE_OVERLAP: bool = True
+    VLLM_SAIL_MEGA_MOE_ULTRA_EP: bool = False
+    VLLM_SAIL_MEGA_MOE_ULTRA_EP_MIN_TOKENS: int = 256
+    VLLM_SAIL_MEGA_MOE_ULTRA_EP_REDUNDANT_EXPERTS: int = 2
     VLLM_SAIL_DISABLE_MEGA_MHC: bool = False
     VLLM_SAIL_USE_TRITON_INT8_QUANT: bool = True
     VLLM_SAIL_FP8_LOAD_POLICY: str | None = None
@@ -261,6 +264,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # by the CUDA-free manifest; this flag cannot supply those kernels.
     "VLLM_SAIL_ENABLE_MOE_MARLIN": _bool("VLLM_SAIL_ENABLE_MOE_MARLIN", False),
     "VLLM_SAIL_STEP5_MEGA_MOE_OVERLAP": _bool("VLLM_SAIL_STEP5_MEGA_MOE_OVERLAP", True),
+    "VLLM_SAIL_MEGA_MOE_ULTRA_EP": _bool("VLLM_SAIL_MEGA_MOE_ULTRA_EP", False),
+    "VLLM_SAIL_MEGA_MOE_ULTRA_EP_MIN_TOKENS": _int(
+        "VLLM_SAIL_MEGA_MOE_ULTRA_EP_MIN_TOKENS", 256
+    ),
+    "VLLM_SAIL_MEGA_MOE_ULTRA_EP_REDUNDANT_EXPERTS": _int(
+        "VLLM_SAIL_MEGA_MOE_ULTRA_EP_REDUNDANT_EXPERTS", 2
+    ),
     "VLLM_SAIL_MEGA_MOE_MMA_TYPE": _choice(
         "VLLM_SAIL_MEGA_MOE_MMA_TYPE", "fp8xmxfp4", MEGA_MOE_MMA_TYPES
     ),

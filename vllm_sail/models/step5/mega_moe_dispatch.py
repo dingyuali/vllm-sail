@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Opaque dispatch for optional Step5 MegaMoE stream scheduling."""
+"""Opaque dispatch for optional Step5 MegaMoE replica and stream scheduling."""
 
 import torch
 from vllm import envs as vllm_envs
@@ -33,9 +33,15 @@ def _dispatch(
     run_shared: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     experts = get_forward_context().no_compile_layers[_resolve_layer_name(layer_name)]
+    if not run_shared:
+        return hidden_states.new_empty((0,)), experts(
+            hidden_states, weights, ids, padding
+        )
     shared_expert = experts._sail_shared_expert()
     stream = None
-    if overlap_allowed(hidden_states.shape[0], experts._sail_sequence_parallel):
+    if experts.ultra_ep is None and overlap_allowed(
+        hidden_states.shape[0], experts._sail_sequence_parallel
+    ):
         stream = aux_stream()
     if stream is None:
         return (
@@ -74,8 +80,13 @@ def register_ops():
 
 
 def can_overlap(layer, hidden_states):
-    return not layer.share_expert.shard_sequence_parallel and overlap_allowed(
-        hidden_states.numel() // hidden_states.shape[-1], layer.use_sequence_parallel
+    return (
+        layer.experts.routed_experts.ultra_ep is None
+        and not layer.share_expert.shard_sequence_parallel
+        and overlap_allowed(
+            hidden_states.numel() // hidden_states.shape[-1],
+            layer.use_sequence_parallel,
+        )
     )
 
 
@@ -91,4 +102,14 @@ def dispatch(layer, hidden_states, weights, ids, padding):
             True,
         )
     shared = layer.share_expert(hidden_states)
+    if experts.ultra_ep is not None:
+        _, routed = torch.ops.vllm.sail_step5_mega_moe_dispatch(
+            hidden_states,
+            weights,
+            ids,
+            padding,
+            _encode_layer_name(experts.prefix),
+            False,
+        )
+        return shared, routed
     return shared, experts(hidden_states, weights, ids, padding)
