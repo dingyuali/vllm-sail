@@ -122,6 +122,14 @@ configuration-derived shapes, not captured serving inputs. ACU counters,
 cold-cache performance, whole-model accuracy and HTTP throughput are not accepted
 by that comparison. The switch remains opt-in.
 
+## Step5 QK Norm, RoPE and KV Cache
+
+Set `VLLM_SAIL_STEP5_QKNORM_ROPE_CACHEKV=1` to enable the Triton cache-write
+fusion on Step5 M890 BF16 inputs with head dimension 192 and rotary dimension
+64 or 192. The default is on. The joint DSA indexer preparation and FP8 KV
+cache paths keep their existing dispatch. Use separate compilation cache
+directories when comparing the setting on and off.
+
 ## Step5 Score
 
 `VLLM_SAIL_STEP5_DSA_SCORES` selects the **prefill** scorer:
