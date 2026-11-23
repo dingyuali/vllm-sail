@@ -1,9 +1,99 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Opt-in Step5 MegaMoE split-K routing on M890."""
+"""Optimize Step5 independent and split-K routing on M890."""
 
 from vllm_sail import envs
 
 _installed = False
+
+
+def _install_independent_topk() -> None:
+    import functools
+
+    import torch
+    from vllm import envs as vllm_envs
+    from vllm.model_executor.layers.fused_moe.router import fused_topk_bias_router
+
+    from vllm_sail.models.step5.ops.fused_router import _reduce_router_kernel
+    from vllm_sail.patch.utils import patch
+
+    original = fused_topk_bias_router.vllm_topk_sigmoid
+
+    @patch(
+        fused_topk_bias_router.__name__,
+        "vllm_topk_sigmoid",
+        reason="Reduce latency of independent Step5 sigmoid Top8 at small M on M890.",
+        affected_versions=">=0.33.0,<0.34.0",
+        remove_when="Native biased sigmoid TopK matches small-M Triton latency.",
+    )
+    @functools.wraps(original)
+    def topk_sigmoid(
+        topk_weights,
+        topk_indices,
+        token_expert_indices,
+        gating_output,
+        renormalize=False,
+        e_score_correction_bias=None,
+        routed_scaling_factor=1.0,
+    ):
+        rows = gating_output.shape[0]
+        bias = e_score_correction_bias
+        if (
+            vllm_envs.VLLM_BATCH_INVARIANT
+            or not 0 < rows <= 512
+            or gating_output.shape != (rows, 352)
+            or topk_weights.shape != (rows, 8)
+            or gating_output.dtype != torch.float32
+            or not gating_output.is_cuda
+            or bias is None
+            or bias.shape != (352,)
+            or bias.dtype != torch.float32
+            or not all(
+                t.is_contiguous()
+                for t in (
+                    gating_output,
+                    bias,
+                    topk_weights,
+                    topk_indices,
+                    token_expert_indices,
+                )
+            )
+            or topk_indices.dtype not in (torch.int32, torch.int64)
+        ):
+            return original(
+                topk_weights,
+                topk_indices,
+                token_expert_indices,
+                gating_output,
+                renormalize,
+                bias,
+                routed_scaling_factor,
+            )
+        sms = torch.cuda.get_device_properties(
+            gating_output.device
+        ).multi_processor_count
+        warps = 8 if rows <= sms else 4 if rows <= 4 * sms else 1
+        padding = fused_topk_bias_router._get_padding_mask(rows)
+        if padding is not None:
+            padding = padding.contiguous()
+        _reduce_router_kernel[(rows,)](
+            gating_output,
+            bias,
+            topk_weights,
+            topk_indices,
+            padding,
+            352,
+            0,
+            SPLIT_K=1,
+            RENORMALIZE=renormalize,
+            SCALING=routed_scaling_factor,
+            IDX64=topk_indices.dtype == torch.int64,
+            PARALLEL_TOPK=False,
+            HAS_PADDING=padding is not None,
+            source_rows_ptr=token_expert_indices,
+            num_warps=warps,
+            num_stages=2,
+        )
+        return topk_weights, topk_indices
 
 
 def install() -> None:
@@ -13,11 +103,12 @@ def install() -> None:
 
     from vllm.platforms import current_platform
 
-    if (
-        not envs.VLLM_SAIL_STEP5_FUSED_ROUTER
-        or not current_platform.is_ppu()
-        or not current_platform.is_device_capability(89)
-    ):
+    if not current_platform.is_ppu() or not current_platform.is_device_capability(89):
+        return
+
+    _install_independent_topk()
+    if not envs.VLLM_SAIL_STEP5_FUSED_ROUTER:
+        _installed = True
         return
 
     import functools

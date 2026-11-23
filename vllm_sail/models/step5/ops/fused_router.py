@@ -138,6 +138,7 @@ def _reduce_router_kernel(
     IDX64: tl.constexpr,
     PARALLEL_TOPK: tl.constexpr,
     HAS_PADDING: tl.constexpr,
+    source_rows_ptr=None,
 ):
     row = tl.program_id(0)
     experts = tl.arange(0, 512)
@@ -180,11 +181,16 @@ def _reduce_router_kernel(
         total = 0.0
         for k in tl.static_range(8):
             score, index = tl.max(scores, axis=0, return_indices=True)
-            weight = score - tl.load(bias_ptr + index).to(tl.float32)
-            weights = tl.where(ks == k, weight, weights)
+            if source_rows_ptr is None:
+                weight = score - tl.load(bias_ptr + index).to(tl.float32)
+                weights = tl.where(ks == k, weight, weights)
+                total += weight
             indices = tl.where(ks == k, index, indices)
-            total += weight
             scores = tl.where(experts == index, -float("inf"), scores)
+    if source_rows_ptr is not None:
+        weights = tl.gather(probs, indices, 0)
+        total = tl.sum(weights, axis=0)
+        tl.store(source_rows_ptr + row * 8 + ks, ks * tl.num_programs(0) + row)
     if RENORMALIZE:
         if PARALLEL_TOPK:
             weights *= tl.div_rn(SCALING, total + 1e-20)
