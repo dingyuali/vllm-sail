@@ -539,4 +539,5 @@ Build-time settings such as `PPU_SDK`, `HGCC`, `CMAKE_HGCC_DIR` and
 
 | Variable | Default | Effect |
 | --- | --- | --- |
+| `VLLM_SAIL_STEP5_FUSED_ROUTER` | `1` | Fuse split-K router reduction and TopK on supported M890 MegaMoE inputs. |
 | `VLLM_SAIL_STEP5_INDEXER_PER_TOKEN` | `1` | Use the per-token norm and RoPE kernel for supported large M890 indexer batches. |

@@ -56,6 +56,7 @@ if TYPE_CHECKING:
     VLLM_SAIL_STEP5_DSA_SCORE_DECODE: str = "v0"
     VLLM_SAIL_STEP5_JOINT_PREPARE: bool = False
     VLLM_SAIL_STEP5_QKNORM_ROPE_CACHEKV: bool = True
+    VLLM_SAIL_STEP5_FUSED_ROUTER: bool = True
     VLLM_SAIL_STEP5_INDEXER_PER_TOKEN: bool = True
     VLLM_SAIL_STEP5_DSA_SELECTOR_PPU: bool = False
     VLLM_SAIL_STEP5_DSA_PREFILL_PPU: bool = False
@@ -97,6 +98,7 @@ if TYPE_CHECKING:
     VLLM_PPU_STEP5_DSA_SCORE_DECODE: str = "v0"
     VLLM_PPU_STEP5_JOINT_PREPARE: bool = False
     VLLM_PPU_STEP5_QKNORM_ROPE_CACHEKV: bool = True
+    VLLM_PPU_STEP5_FUSED_ROUTER: bool = True
     VLLM_PPU_STEP5_INDEXER_PER_TOKEN: bool = True
     VLLM_PPU_STEP5_DSA_SELECTOR_PPU: bool = False
     VLLM_PPU_STEP5_DSA_PREFILL_PPU: bool = False
@@ -288,6 +290,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_SAIL_KPOOL_MAX_DENSE_POOLS", 1 << 21
     ),
     # -- Step5 DSA ----------------------------------------------------------
+    "VLLM_SAIL_STEP5_FUSED_ROUTER": _bool("VLLM_SAIL_STEP5_FUSED_ROUTER", True),
     "VLLM_SAIL_STEP5_INDEXER_PER_TOKEN": _bool(
         "VLLM_SAIL_STEP5_INDEXER_PER_TOKEN", True
     ),
