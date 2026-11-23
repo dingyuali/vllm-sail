@@ -739,23 +739,93 @@ class NativePrefill:
                 raise RuntimeError("native op became unavailable after binding")
             # Never resubmit, even after a failed launch; the outer finally releases.
             self._finished = True
-            _submit_attention(
-                op,
-                "prefill",
-                query,
-                cache,
-                regions,
-                table,
-                owners,
-                self.positions,
-                tiles,
-                out,
-                logical,
-                self.scale,
-                self.query_tile,
+            self._submit_batched(
+                op, query, cache, regions, table, owners, tiles, out, logical
             )
             record_submission("prefill")
         self._finished = True
+
+    def _submit_batched(
+        self, op, query, cache, regions, table, owners, tiles, out, logical
+    ):
+        return _submit_attention(
+            op,
+            "prefill",
+            query,
+            cache,
+            regions,
+            table,
+            owners,
+            self.positions,
+            tiles,
+            out,
+            logical,
+            self.scale,
+            self.query_tile,
+        )
+
+
+def fp8_prefill_request(query, cache, regions, pages, positions, kv_len, scale, out):
+    """Materialize logical K/V from one request's interleaved SAIL pages."""
+    from vllm_sail import _custom_ops
+
+    from .fp8_prefill_inputs import prepare_fp8_prefill_inputs
+
+    op = _custom_ops.step5_dsa_fp8_prefill_op()
+    if op is None:
+        raise RuntimeError("Step5 FP8 prefill requires rebuilt SAIL kernels")
+    key, value, slots = prepare_fp8_prefill_inputs(cache, pages, regions, kv_len)
+    return op(
+        query,
+        key,
+        value,
+        slots,
+        positions,
+        8,
+        kv_len,
+        scale,
+        1.0,
+        1.0,
+        1.0,
+        out,
+    )
+
+
+class NativeFP8Prefill(NativePrefill):
+    """Opt-in native FP8 consumer for BF16 D192 input and paged KV."""
+
+    def bind(self, query, cache, table, starts, output, k_scale, v_scale):
+        from vllm_sail import _custom_ops
+
+        if _custom_ops.step5_dsa_fp8_prefill_op() is None:
+            raise RuntimeError("Step5 FP8 prefill requires rebuilt SAIL kernels")
+        if not output.is_contiguous():
+            return "fp8_prefill_output"
+        reason = super().bind(query, cache, table, starts, output, k_scale, v_scale)
+        if reason is None:
+            self._request_starts = tuple(starts)
+        return reason
+
+    def _submit_batched(
+        self, op, query, cache, regions, table, owners, tiles, out, logical
+    ):
+        starts = self._request_starts
+        for request, (start, end) in enumerate(
+            zip(starts[:-1], starts[1:], strict=True)
+        ):
+            if start == end:
+                continue
+            kv_len = max(self.host_positions[start:end]) + 1
+            fp8_prefill_request(
+                query[start:end],
+                cache,
+                regions[start:end],
+                table[request],
+                self.positions[start:end],
+                kv_len,
+                self.scale,
+                out[start:end],
+            )
 
 
 def wrap_decode(original, backend, platform):

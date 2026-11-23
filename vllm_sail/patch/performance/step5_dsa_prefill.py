@@ -176,8 +176,14 @@ def install():
             reason = modern.candidate_reason(query_shape, dtype, device, block_size,
                                              region_count, scale)
             if reason is None:
+                if envs.VLLM_SAIL_STEP5_DSA_PREFILL_FP8:
+                    return modern.NativeFP8Prefill(
+                        query_shape, device, positions, region_count, scale,
+                        batch_attention=True,
+                    )
                 return modern.NativePrefill(query_shape, device, positions,
-                                            region_count, scale, 0,
+                                            region_count, scale,
+                                            envs.VLLM_SAIL_STEP5_DSA_PREFILL_QUERY_TILE,
                                             batch_attention=envs.VLLM_SAIL_STEP5_DSA_PREFILL_BATCH_ATTENTION)
             modern.reject(reason)
         return original_prepare(self, query_shape, dtype, device, block_size,

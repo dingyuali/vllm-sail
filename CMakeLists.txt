@@ -152,6 +152,17 @@ target_compile_definitions(_upstream_C PRIVATE VLLM_ENABLE_FUSED_GDN_DECODE=1)
 ppu_add_extension(_upstream_moe_C SOURCES ${PPU_UPSTREAM_MOE_EXT_SRC})
 
 # Plugin-owned HGGC kernels and stable-ABI bindings, under private _ppu_* namespaces.
+set_property(SOURCE csrc/plugin/step5/step5_dsa_fp8_prefill.hg PROPERTY COMPILE_OPTIONS
+  -O3 --use_fast_math
+  -mllvm -ppu-max-vreg-count=256
+  -mllvm -ppu-sink-matrix-addr=true
+  -mllvm -ppu-sink-async-addr=true
+  -mllvm -ppu-sink-load-addr=true
+  -mllvm -ppu-sink-store-addr=true
+  -mllvm -ppu-max-alloca-byte-size=320
+  -mllvm -ppu-alloca-half-ldst-simplify=true
+  -mllvm -ppu-force-warpage=true
+  -mllvm -ppu-force-vregrr=true)
 ppu_add_extension(_C
   INCLUDE_ROOT csrc/plugin
   SOURCES ${PPU_PLUGIN_EXT_SRC})

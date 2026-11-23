@@ -64,6 +64,8 @@ if TYPE_CHECKING:
     VLLM_SAIL_STEP5_INDEXER_PER_TOKEN: bool = True
     VLLM_SAIL_STEP5_DSA_SELECTOR_PPU: bool = False
     VLLM_SAIL_STEP5_DSA_PREFILL_PPU: bool = False
+    VLLM_SAIL_STEP5_DSA_PREFILL_QUERY_TILE: int = 0
+    VLLM_SAIL_STEP5_DSA_PREFILL_FP8: bool = False
     VLLM_SAIL_STEP5_DSA_PREFILL_BACKEND: str = "flashinfer"
     VLLM_SAIL_STEP5_DSA_PREFILL_BATCH_ATTENTION: bool = True
     VLLM_STEP5_INDEXER_FP8_AS_FP16: bool = False
@@ -106,6 +108,8 @@ if TYPE_CHECKING:
     VLLM_PPU_STEP5_INDEXER_PER_TOKEN: bool = True
     VLLM_PPU_STEP5_DSA_SELECTOR_PPU: bool = False
     VLLM_PPU_STEP5_DSA_PREFILL_PPU: bool = False
+    VLLM_PPU_STEP5_DSA_PREFILL_QUERY_TILE: int = 0
+    VLLM_PPU_STEP5_DSA_PREFILL_FP8: bool = False
     VLLM_PPU_STEP5_DSA_PREFILL_BACKEND: str = "flashinfer"
     VLLM_PPU_STEP5_DSA_PREFILL_BATCH_ATTENTION: bool = True
     VLLM_PPU_NVTX_PROFILE: bool = False
@@ -327,6 +331,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SAIL_STEP5_DSA_SELECTOR_PPU": _bool(
         "VLLM_SAIL_STEP5_DSA_SELECTOR_PPU", False
     ),
+    "VLLM_SAIL_STEP5_DSA_PREFILL_QUERY_TILE": _int(
+        "VLLM_SAIL_STEP5_DSA_PREFILL_QUERY_TILE", 0
+    ),
+    "VLLM_SAIL_STEP5_DSA_PREFILL_FP8": _bool("VLLM_SAIL_STEP5_DSA_PREFILL_FP8", False),
     # Selects native paged attention during prefill metadata planning.
     "VLLM_SAIL_STEP5_DSA_PREFILL_PPU": _bool("VLLM_SAIL_STEP5_DSA_PREFILL_PPU", False),
     # Defaults to FlashInfer; native opts into the new prefill/decode and the old
@@ -416,6 +424,7 @@ _aliases: dict[str, tuple[str, ...]] = {
 }
 _aliases["VLLM_SAIL_NVTX_PROFILE"] += ("SAIL_NVTX_PROFILE",)
 _aliases["VLLM_SAIL_DISABLE_MEGA_MHC"] += ("SAIL_DISABLE_MEGA_MHC",)
+_aliases["VLLM_SAIL_STEP5_DSA_PREFILL_FP8"] += ("VLLM_STEP5_DSA_PREFILL_FP8",)
 _canonical_names = {
     alias: name for name, aliases in _aliases.items() for alias in aliases
 }
