@@ -86,6 +86,7 @@ _install(
         _indexer._indexer_norm_rope,
         soft_fp8._indexer_norm_rope,
         byte_args=(8,),
+        optimize_indexer=True,
     ),
 )
 # _joint_prepare itself has no FP8 op; its indexer half is the helper above.

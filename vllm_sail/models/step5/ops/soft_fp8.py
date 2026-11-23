@@ -179,10 +179,16 @@ def _indexer_norm_rope(
     EPS: tl.constexpr,
     WEIGHT_BIAS: tl.constexpr,
     NATIVE_ROPE: tl.constexpr,
+    # PPU MODIFICATION: begin — slot-first launch for the independent indexer.
+    SLOT_FIRST: tl.constexpr = False,
+    # PPU MODIFICATION: end
 ):
-    token = tl.program_id(0)
-    group = tl.program_id(1) // PAD_HEADS
-    head = tl.program_id(1) % PAD_HEADS
+    # PPU MODIFICATION: begin — slot-first launch for the independent indexer.
+    token = tl.program_id(1) if SLOT_FIRST else tl.program_id(0)
+    program_slot = tl.program_id(0) if SLOT_FIRST else tl.program_id(1)
+    # PPU MODIFICATION: end
+    group = program_slot // PAD_HEADS
+    head = program_slot % PAD_HEADS
     dim = tl.arange(0, 256)
     if (group < GROUPS) & (head < HEADS):
         x = tl.load(Q + token * Q_STRIDE + (group * HEADS + head) * 256 + dim).to(
@@ -211,14 +217,25 @@ def _indexer_norm_rope(
 
     if (head < HEADS) | (group == GROUPS):
         position = tl.load(Positions + token)
-        half = ROTARY // 2
-        partner_dim = tl.where(
-            dim < half, dim + half, tl.where(dim < ROTARY, dim - half, dim)
-        )
-        partner = tl.gather(x, partner_dim, 0)
-        phase = dim % half
-        cos = tl.load(Rope + position * ROPE_STRIDE + phase)
-        sin = tl.load(Rope + position * ROPE_STRIDE + half + phase)
+        half: tl.constexpr = ROTARY // 2
+        # PPU MODIFICATION: begin — NeoX pairs use a register flip.
+        if SLOT_FIRST:
+            groups: tl.constexpr = 256 // ROTARY
+            partner = tl.flip(x.reshape((groups, 2, half)), 1).reshape((256,))
+            phase = tl.arange(0, half)
+            cos = tl.load(Rope + position * ROPE_STRIDE + phase)
+            sin = tl.load(Rope + position * ROPE_STRIDE + half + phase)
+            cos = tl.broadcast_to(cos[None, None, :], (groups, 2, half)).reshape((256,))
+            sin = tl.broadcast_to(sin[None, None, :], (groups, 2, half)).reshape((256,))
+        else:
+            partner_dim = tl.where(
+                dim < half, dim + half, tl.where(dim < ROTARY, dim - half, dim)
+            )
+            partner = tl.gather(x, partner_dim, 0)
+            phase = dim % half
+            cos = tl.load(Rope + position * ROPE_STRIDE + phase)
+            sin = tl.load(Rope + position * ROPE_STRIDE + half + phase)
+        # PPU MODIFICATION: end
         first = x * cos.to(tl.float32)
         second = tl.where(dim < half, -partner, partner) * sin.to(tl.float32)
         if NATIVE_ROPE:
@@ -643,10 +660,13 @@ class ByteFP8Launch:
     cache the kernel stores into by value) are left alone.
     """
 
-    def __init__(self, upstream, ppu, byte_args: tuple[int, ...]):
+    def __init__(
+        self, upstream, ppu, byte_args: tuple[int, ...], *, optimize_indexer=False
+    ):
         self.upstream = upstream
         self.ppu = ppu
         self.byte_args = byte_args
+        self.optimize_indexer = optimize_indexer
         self.__name__ = getattr(upstream, "__name__", type(self).__name__)
         self.__doc__ = getattr(upstream, "__doc__", None)
 
@@ -661,7 +681,9 @@ class ByteFP8Launch:
                 and args[index].dtype == torch.float16
                 for index in byte_args
             )
-            if not (half or current_platform.is_ppu()):
+            is_ppu = current_platform.is_ppu()
+            launch_grid = grid
+            if not (half or is_ppu):
                 return self._submit_paged(
                     self.upstream[grid], args, kwargs, source, "upstream_paged"
                 )
@@ -669,8 +691,63 @@ class ByteFP8Launch:
                 arg = args[index]
                 if isinstance(arg, torch.Tensor) and arg.dtype == torch.float8_e4m3fn:
                     args[index] = arg.view(torch.uint8)
+            # Standalone indexer launch signature at the verified vLLM pin:
+            # UPDATE_CSA, HEADS, GROUPS and ROTARY are slots 16, 26, 28 and 30.
+            if (
+                self.optimize_indexer
+                and is_ppu
+                and not args[16]
+                and args[26] in (4, 8)
+                and args[28] == 1
+                and args[30] in (32, 64)
+            ):
+                # The opt-in port keeps v0.23 norm and RoPE rounding.
+                if (
+                    envs.VLLM_SAIL_STEP5_INDEXER_PER_TOKEN
+                    and args[29] >= 1024
+                    and args[33] == 1.0
+                    and current_platform.is_device_capability(89)
+                ):
+                    from vllm_sail.models.step5.ops.indexer_per_token import (
+                        _dsa_indexer_qknorm_rope_kernel_per_token,
+                    )
+
+                    _dsa_indexer_qknorm_rope_kernel_per_token[(args[29],)](
+                        args[0],
+                        args[1],
+                        args[7],
+                        args[3],
+                        args[4],
+                        args[5],
+                        args[6],
+                        args[8],
+                        args[9],
+                        args[2],
+                        args[10],
+                        args[25],
+                        args[23],
+                        args[24],
+                        args[31],
+                        0,
+                        0,
+                        args[29],
+                        Q_HEADS=args[26],
+                        PAD_HEADS=args[27],
+                        PROXY_DIM=256,
+                        BLOCK_D=256,
+                        ROT_DIM=args[30],
+                        HALF_ROT=args[30] // 2,
+                        EPS=args[32],
+                        Q_WEIGHT_OFFSET=args[33],
+                        BLOCK_T=1,
+                        num_warps=1,
+                    )
+                    return None
+                kwargs["num_warps"] = 1
+                kwargs["SLOT_FIRST"] = True
+                launch_grid = (grid[1], grid[0])
             return self._submit_paged(
-                self.ppu[grid],
+                self.ppu[launch_grid],
                 args,
                 kwargs,
                 source,

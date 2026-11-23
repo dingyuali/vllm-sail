@@ -534,3 +534,9 @@ importing ACEXT fails on an unresolved cuBLAS symbol, the plugin preloads
 
 Build-time settings such as `PPU_SDK`, `HGCC`, `CMAKE_HGCC_DIR` and
 `PYTORCH_SAIL_ARCH` are documented in [HGGC kernels](../developer_guide/kernels.md#build-settings).
+
+## Step5 optimization switches
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `VLLM_SAIL_STEP5_INDEXER_PER_TOKEN` | `1` | Use the per-token norm and RoPE kernel for supported large M890 indexer batches. |
