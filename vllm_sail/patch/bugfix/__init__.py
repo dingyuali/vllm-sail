@@ -6,7 +6,9 @@ def install() -> None:
     from vllm_sail.patch.bugfix import (
         async_llm_shutdown,
         glm5_next_int8_mla_dequant,
+        step5_pp_intermediates,
     )
 
     async_llm_shutdown.install()
     glm5_next_int8_mla_dequant.install()
+    step5_pp_intermediates.install()
