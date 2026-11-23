@@ -15,6 +15,7 @@ import pytest
 from vllm_sail import envs
 
 BOOL_DEFAULTS = {
+    "STEP5_MEGA_MOE_OVERLAP": True,
     "FUSED_RMSNORM_QUANT": False,
     "USE_OPT_TOKEN_GROUP_QUANT": False,
     "DENSE_BF16_DEEPGEMM": False,

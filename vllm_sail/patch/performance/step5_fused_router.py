@@ -107,11 +107,14 @@ def install() -> None:
         return
 
     _install_independent_topk()
-    if not envs.VLLM_SAIL_STEP5_FUSED_ROUTER:
+    fuse_router = envs.VLLM_SAIL_STEP5_FUSED_ROUTER
+    optimize_dispatch = envs.VLLM_SAIL_STEP5_MEGA_MOE_OVERLAP
+    if not (fuse_router or optimize_dispatch):
         _installed = True
         return
 
     import functools
+    from weakref import ref
 
     import torch
     from vllm import envs as vllm_envs
@@ -127,14 +130,34 @@ def install() -> None:
         affected_versions=">=0.33.0,<0.34.0",
         remove_when="Step5 MegaMoE exposes a fused gate and TopK router entry point.",
     )
-    register_ops()
-    original_load = model.Step5ForCausalLM.load_weights
+    if fuse_router:
+        register_ops()
     original_forward = model.Step5MoE.forward
+    original_load = model.Step5ForCausalLM.load_weights
+    original_init = model.Step5MoE.__init__
+
+    if optimize_dispatch:
+        from vllm_sail.models.step5 import mega_moe_dispatch
+
+        mega_moe_dispatch.register_ops()
+
+        @patch(model.__name__, "Step5MoE.__init__", **meta)
+        @functools.wraps(original_init)
+        def init(self, *args, **kwargs):
+            original_init(self, *args, **kwargs)
+            # PPU MODIFICATION: begin — the opaque dispatch resolves the current layer.
+            experts = getattr(self.experts, "routed_experts", None)
+            if isinstance(experts, PPUStep5MegaMoEExperts):
+                experts._sail_shared_expert = ref(self.share_expert)
+                experts._sail_sequence_parallel = self.use_sequence_parallel
+            # PPU MODIFICATION: end
 
     @patch(model.__name__, "Step5ForCausalLM.load_weights", **meta)
     @functools.wraps(original_load)
     def load_weights(self, weights):
         loaded = original_load(self, weights)
+        if not fuse_router:
+            return loaded
         for layer in self.modules():
             if not isinstance(layer, model.Step5MoE):
                 continue
@@ -155,36 +178,46 @@ def install() -> None:
     @patch(model.__name__, "Step5MoE.forward", **meta)
     @functools.wraps(original_forward)
     def forward(self, hidden_states, padding=None):
-        bf16_weight = getattr(self, "_sail_router_bf16_weight", None)
-        if (
-            bf16_weight is None
-            or hidden_states.dtype != torch.bfloat16
-            or bf16_weight.device != hidden_states.device
-            or self.enable_eplb
-            or vllm_envs.VLLM_BATCH_INVARIANT
-        ):
-            return original_forward(self, hidden_states, padding)
-
         experts = self.experts
+        routed_experts = getattr(experts, "routed_experts", None)
+        if not isinstance(routed_experts, PPUStep5MegaMoEExperts):
+            return original_forward(self, hidden_states, padding)
+        bf16_weight = getattr(self, "_sail_router_bf16_weight", None)
         router = experts.router
-        if (
-            router.scoring_func != "sigmoid"
-            or router.top_k != 8
-            or router.capture_fn is not None
-        ):
+        fused = (
+            bf16_weight is not None
+            and hidden_states.dtype == torch.bfloat16
+            and bf16_weight.device == hidden_states.device
+            and not self.enable_eplb
+            and not vllm_envs.VLLM_BATCH_INVARIANT
+            and router.scoring_func == "sigmoid"
+            and router.top_k == 8
+            and router.capture_fn is None
+        )
+        dispatch_enabled = optimize_dispatch and mega_moe_dispatch.can_overlap(
+            self, hidden_states
+        )
+        if not fused and not dispatch_enabled:
             return original_forward(self, hidden_states, padding)
 
         # PPU MODIFICATION: begin — bypass materialized logits for the MegaMoE path.
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-        shared = self.share_expert(hidden_states)
-        weights, ids = torch.ops.vllm.ppu_step5_fused_router(
-            hidden_states,
-            self.gate.weight,
-            bf16_weight,
-            self.router_bias,
-            router.renormalize,
-            router.routed_scaling_factor,
-        )
+        if not dispatch_enabled:
+            shared = self.share_expert(hidden_states)
+        if fused:
+            weights, ids = torch.ops.vllm.ppu_step5_fused_router(
+                hidden_states,
+                self.gate.weight,
+                bf16_weight,
+                self.router_bias,
+                router.renormalize,
+                router.routed_scaling_factor,
+            )
+        else:
+            logits, _ = self.gate(hidden_states)
+            weights, ids = router.select_experts(
+                hidden_states, logits, topk_indices_dtype=torch.int64
+            )
         if (
             padding is None
             and not experts.sequence_parallel
@@ -193,7 +226,11 @@ def install() -> None:
         ):
             mask = get_forward_context().is_padding
             padding = mask[: hidden_states.shape[0]] if mask is not None else None
-        return shared, experts.routed_experts(hidden_states, weights, ids, padding)
+        if dispatch_enabled:
+            return mega_moe_dispatch.dispatch(
+                self, hidden_states, weights, ids, padding
+            )
+        return shared, routed_experts(hidden_states, weights, ids, padding)
         # PPU MODIFICATION: end
 
     _installed = True
