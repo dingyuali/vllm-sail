@@ -542,6 +542,12 @@ Build-time settings such as `PPU_SDK`, `HGCC`, `CMAKE_HGCC_DIR` and
 | `VLLM_SAIL_STEP5_FUSED_ROUTER` | `1` | Fuse split-K router reduction and TopK on supported M890 MegaMoE inputs. |
 | `VLLM_SAIL_STEP5_INDEXER_PER_TOKEN` | `1` | Use the per-token norm and RoPE kernel for supported large M890 indexer batches. |
 | `VLLM_SAIL_STEP5_MEGA_MOE_OVERLAP` | `1` | Overlap shared and routed experts for eligible sequence-parallel batches. |
+| `VLLM_SAIL_STEP5_DSA_SELECTOR_PPU` | `0` | Opt in to the native PPU DSA region selector. |
 | `VLLM_SAIL_MEGA_MOE_ULTRA_EP` | `0` | Enable optional expert replicas for eligible MXFP4 prefill. Missing UltraEP or incompatible graph settings leave regular MegaMoE active. |
 | `VLLM_SAIL_MEGA_MOE_ULTRA_EP_MIN_TOKENS` | `256` | Minimum local tokens for UltraEP. It must exceed the largest local captured CUDA graph size when CUDA graphs are enabled. |
 | `VLLM_SAIL_MEGA_MOE_ULTRA_EP_REDUNDANT_EXPERTS` | `2` | Number of replica experts per EP rank. |
+
+For disaggregated Step5 DSA, use a supported connector such as
+`MooncakeStoreConnector` or `NixlConnector` with CUDA buffers.
+Ordinary `MooncakeConnector` is rejected by Step5's cache compatibility check.
+Use the same indexer summary storage dtype on the prefill and decode workers.

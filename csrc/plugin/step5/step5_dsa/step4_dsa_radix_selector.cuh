@@ -62,19 +62,10 @@ static_assert(kThreads >= 256 && kThreads <= 1024 &&
                   (kThreads & (kThreads - 1)) == 0,
               "Step4 DSA selector threads must be a power of two in [256,1024]");
 
-// Shared storage for selector and chunk kernels.
-// The histogram and (equal_counts + warp_sum) are used in disjoint phases,
-// so they share memory via a union.  The histogram is sized for the coarsest
-// round (kCoarseRadix = 2048); equal_counts needs kThreads entries and
-// warp_sum needs kThreads/32, both smaller than 2048.
+// Threshold scans read histogram bins while publishing warp subtotals.
 struct Step4DsaRadixShared {
-  union {
-    int histogram[kCoarseRadix];
-    struct {
-      int equal_counts[kThreads];
-      int warp_sum[kThreads / 32];
-    };
-  };
+  int histogram[kCoarseRadix];
+  int warp_sum[kThreads / 32];
   uint32_t prefix_value;
   uint32_t prefix_mask;
   int threshold;
@@ -82,6 +73,10 @@ struct Step4DsaRadixShared {
   int selected_base;
   int output_counter;
   int count_greater;
+};
+
+// Chunk CTAs stream scores and only allocate the radix scratch.
+struct Step4DsaCachedRadixShared : Step4DsaRadixShared {
   // Hybrid score cache for the single-CTA selector path.
   // Regions [0, kRegisterCacheRegions) are held in per-thread registers;
   // regions [kRegisterCacheRegions, kMaxBufferedRegions) are cached here.
@@ -89,10 +84,8 @@ struct Step4DsaRadixShared {
 };
 
 struct Step4DsaMergeRadixShared {
-  union {
-    int histogram[kCoarseRadix];
-    int warp_sum[kThreads / 32];
-  };
+  int histogram[kCoarseRadix];
+  int warp_sum[kThreads / 32];
   uint32_t score_prefix_value;
   uint32_t score_prefix_mask;
   uint32_t region_prefix_value;
@@ -169,9 +162,7 @@ __device__ __forceinline__ int claim_warp_output_slots(
 
 // Hierarchical warp-shuffle suffix sum for equal-count reduction.
 // Returns the number of "equal" regions held by threads with a larger global
-// index than this thread.  Replaces the tree reduction over
-// storage.equal_counts[] with two warp-level shuffle passes plus two
-// __syncthreads, cutting sync overhead from 2*log2(kThreads) to 2.
+// index than this thread, using two warp-level shuffle passes.
 __device__ __forceinline__ int equal_count_higher_equal(
     int local_equal, int thread, Step4DsaRadixShared& storage) {
   int const lane_id = thread & 31;
@@ -337,7 +328,7 @@ __global__ void step4_dsa_radix_selector_kernel(
     int regions, int topk, int region_block, int page_size,
     int block_table_stride, int block_table_length, bool packed) {
   extern __shared__ char raw_shared[];
-  auto& storage = *reinterpret_cast<Step4DsaRadixShared*>(raw_shared);
+  auto& storage = *reinterpret_cast<Step4DsaCachedRadixShared*>(raw_shared);
   int const work = blockIdx.x;
   int const request = work / heads;
   int const head = work - request * heads;
@@ -348,6 +339,22 @@ __global__ void step4_dsa_radix_selector_kernel(
       position <= 0 ? 0 : min(position / region_block, int64_t(regions - 1)));
   int const target = min(topk, current);
   float const* score_row = scores + (request * heads + head) * regions;
+
+  if (current <= topk) {
+    for (int slot = thread; slot < output_width; slot += kThreads) {
+      if (slot < current || slot == topk) {
+        store_region(slot == topk ? current : slot, slot, request, head, heads,
+                     output_width, block_table, block_table_stride,
+                     block_table_length, page_size / region_block, region_block,
+                     packed, region_output, start_output);
+      } else {
+        int const offset = work * output_width + slot;
+        region_output[offset] = -1;
+        start_output[offset] = -1;
+      }
+    }
+    return;
+  }
 
   for (int slot = thread; slot < output_width; slot += kThreads) {
     int const offset = work * output_width + slot;
@@ -458,12 +465,18 @@ __global__ void step4_dsa_radix_selector_kernel(
           (uint32_t(storage.threshold) << shift);
       storage.selected_base += storage.count_greater;
       storage.remain -= storage.count_greater;
+      if (storage.remain == storage.histogram[storage.threshold]) {
+        storage.selected_base += storage.remain;
+        storage.remain = 0;
+      }
     }
     __syncthreads();
+    if (storage.remain == 0) break;
   }
 
   // Scatter phase: emit selected regions with warp-local staging.
   uint32_t const threshold_key = storage.prefix_value;
+  bool const include_threshold = storage.remain == 0;
   int local_equal = 0;
   if (thread == 0) {
     storage.output_counter = 0;
@@ -478,8 +491,9 @@ __global__ void step4_dsa_radix_selector_kernel(
     if (valid) {
       key = ordered_score(raw, region);
     }
-    bool const greater = valid && (key > threshold_key);
-    bool const equal = valid && (key == threshold_key);
+    bool const greater =
+        valid && (key > threshold_key || (include_threshold && key == threshold_key));
+    bool const equal = valid && !include_threshold && (key == threshold_key);
     if (greater) {
       staged_regions[staged_count++] = region;
     } else if (equal) {
@@ -566,7 +580,7 @@ __global__ void step4_dsa_radix_selector_kernel(
 
   flush_staged();
   int const higher_equal =
-      equal_count_higher_equal(local_equal, thread, storage);
+      include_threshold ? 0 : equal_count_higher_equal(local_equal, thread, storage);
   int const local_take =
       min(local_equal, max(storage.remain - higher_equal, 0));
   int emitted = 0;
@@ -659,6 +673,15 @@ __global__ void step4_dsa_radix_chunk_kernel(
   int* output_row =
       candidate_output + work * candidate_stride + chunk * topk;
 
+  // Merge only reads the chunks intersecting the request's history.
+  if (valid_length == 0) return;
+  if (valid_length <= topk) {
+    for (int slot = thread; slot < topk; slot += kThreads) {
+      output_row[slot] = slot < valid_length ? chunk_begin + slot : -1;
+    }
+    return;
+  }
+
   for (int slot = thread; slot < topk; slot += kThreads) {
     output_row[slot] = -1;
   }
@@ -707,8 +730,13 @@ __global__ void step4_dsa_radix_chunk_kernel(
           (uint32_t(storage.threshold) << shift);
       storage.selected_base += storage.count_greater;
       storage.remain -= storage.count_greater;
+      if (storage.remain == storage.histogram[storage.threshold]) {
+        storage.selected_base += storage.remain;
+        storage.remain = 0;
+      }
     }
     __syncthreads();
+    if (storage.remain == 0) break;
   }
 
   int const begin =
@@ -716,6 +744,7 @@ __global__ void step4_dsa_radix_chunk_kernel(
   int const end =
       chunk_begin + int((int64_t(valid_length) * (thread + 1)) / kThreads);
   uint32_t const threshold_key = storage.prefix_value;
+  bool const include_threshold = storage.remain == 0;
   int local_equal = 0;
   if (thread == 0) {
     storage.output_counter = 0;
@@ -730,9 +759,10 @@ __global__ void step4_dsa_radix_chunk_kernel(
     int const region = begin + i;
     bool const valid = region < end;
     uint32_t const key = valid ? ordered_score(score_row[region], region) : 0;
-    if (valid && key > threshold_key) {
+    if (valid &&
+        (key > threshold_key || (include_threshold && key == threshold_key))) {
       staged_regions[staged_count++] = region;
-    } else if (valid && key == threshold_key) {
+    } else if (valid && !include_threshold && key == threshold_key) {
       ++local_equal;
     }
     // Always call __any_sync with the full warp so the SIMT mask stays
@@ -769,7 +799,7 @@ __global__ void step4_dsa_radix_chunk_kernel(
     }
   }
   int const higher_equal =
-      equal_count_higher_equal(local_equal, thread, storage);
+      include_threshold ? 0 : equal_count_higher_equal(local_equal, thread, storage);
   int const local_take =
       min(local_equal, max(storage.remain - higher_equal, 0));
   int emitted = 0;
@@ -804,9 +834,29 @@ __global__ void step4_dsa_radix_merge_kernel(
   int const current = static_cast<int>(
       position <= 0 ? 0 : min(position / region_block, int64_t(regions - 1)));
   int const target = min(topk, current);
-  int const candidate_count = num_chunks * topk;
+  int const useful_chunks = min(
+      num_chunks, (current + kStreamingChunkRegions - 1) / kStreamingChunkRegions);
+  int const candidate_count = useful_chunks * topk;
   float const* score_row = scores + work * regions;
   int const* candidate_row = candidate_input + work * candidate_stride;
+
+  if (useful_chunks <= 1) {
+    for (int slot = thread; slot < output_width; slot += kThreads) {
+      int const region = slot == topk ? current
+                         : useful_chunks == 1 ? candidate_row[slot] : -1;
+      if (slot == topk || (region >= 0 && region < current)) {
+        store_region(region, slot, request, head, heads, output_width,
+                     block_table, block_table_stride, block_table_length,
+                     page_size / region_block, region_block, packed,
+                     region_output, start_output);
+      } else {
+        int const offset = work * output_width + slot;
+        region_output[offset] = -1;
+        start_output[offset] = -1;
+      }
+    }
+    return;
+  }
 
   for (int slot = thread; slot < output_width; slot += kThreads) {
     int const offset = work * output_width + slot;
@@ -985,8 +1035,8 @@ void step4_dsa_radix_select(
   int const block_table_length = static_cast<int>(block_table.size(-1));
   auto stream = get_current_cuda_stream(scores.device().index());
 
-  // Request extra shared memory for the 4096-bin histogram.
-  constexpr size_t kSelectorSmem = sizeof(Step4DsaRadixShared);
+  constexpr size_t kSelectorSmem = sizeof(Step4DsaCachedRadixShared);
+  constexpr size_t kChunkSmem = sizeof(Step4DsaRadixShared);
   constexpr size_t kMergeSmem = sizeof(Step4DsaMergeRadixShared);
   static_assert(kSelectorSmem <= 48 * 1024,
                 "selector shared memory exceeds default 48KB limit");
@@ -1012,7 +1062,7 @@ void step4_dsa_radix_select(
         int64_t(num_chunks) * topk, ", got ", candidate_stride);
     step4_dsa_radix_chunk_kernel<<<
         query_rows * heads * num_chunks, kThreads,
-        kSelectorSmem, stream>>>(
+        kChunkSmem, stream>>>(
         scores.data_ptr<float>(), query_positions.data_ptr<int64_t>(),
         candidate_workspace.data_ptr<int>(), heads, regions,
         static_cast<int>(topk), static_cast<int>(region_block), num_chunks,
