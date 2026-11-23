@@ -14,6 +14,7 @@ Step5 DSA indexer scoring kernel.
 
 from vllm_sail.patch.performance import fla  # noqa: F401
 from vllm_sail.patch.performance import qsa_select_config
+from vllm_sail.patch.performance import step5_dp_coordination  # noqa: F401
 from vllm_sail.patch.performance import step5_dsa  # noqa: F401
 from vllm_sail.patch.performance import step5_dsa_selector  # noqa: F401
 from vllm_sail.patch.performance import step5_dsa_prefill  # noqa: F401

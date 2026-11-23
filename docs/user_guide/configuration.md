@@ -545,6 +545,7 @@ Build-time settings such as `PPU_SDK`, `HGCC`, `CMAKE_HGCC_DIR` and
 | `VLLM_SAIL_STEP5_DSA_SELECTOR_PPU` | `0` | Opt in to the native PPU DSA region selector. |
 | `VLLM_SAIL_STEP5_DSA_PREFILL_FP8` | `0` | Opt in to FP8 sparse attention and its KV preparation on supported native prefill inputs. |
 | `VLLM_SAIL_STEP5_DSA_PREFILL_QUERY_TILE` | `0` | Use automatic query tiling for native BF16 prefill. Set `1`, `2`, `4`, or `8` to override it. |
+| `VLLM_SAIL_STEP5_FUSE_DP_COORDINATION` | `0` | Opt in to sharing target metadata with the first Step5 MTP pass. DP ranks check the prediction together before falling back to the regular coordination path. |
 | `VLLM_SAIL_MEGA_MOE_ULTRA_EP` | `0` | Enable optional expert replicas for eligible MXFP4 prefill. Missing UltraEP or incompatible graph settings leave regular MegaMoE active. |
 | `VLLM_SAIL_MEGA_MOE_ULTRA_EP_MIN_TOKENS` | `256` | Minimum local tokens for UltraEP. It must exceed the largest local captured CUDA graph size when CUDA graphs are enabled. |
 | `VLLM_SAIL_MEGA_MOE_ULTRA_EP_REDUNDANT_EXPERTS` | `2` | Number of replica experts per EP rank. |
