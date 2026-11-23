@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""SAIL MXFP4 MegaMoE expert adaptation for Step5."""
+"""SAIL MegaMoE expert adaptation for Step5."""
 
 from contextlib import nullcontext
 from copy import copy
@@ -14,12 +14,12 @@ from vllm.forward_context import (
     is_forward_context_available,
     override_forward_context,
 )
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.model_executor.utils import replace_parameter
 from vllm.models.common.ops.sequence_parallel import sp_all_gather, sp_shard
 from vllm.models.step5.nvidia.mega_moe import _MegaMoEMethod
-from vllm.logger import init_logger
 
 from vllm_sail import envs
 from vllm_sail.model_executor.layers.fused_moe.experts.deep_gemm_mega_moe import (
@@ -27,12 +27,37 @@ from vllm_sail.model_executor.layers.fused_moe.experts.deep_gemm_mega_moe import
 )
 from vllm_sail.utils.deep_gemm_mega import mega_moe_api
 
+_FP8_CHANNELWISE = "fp8_channelwise"
 _MMA_TYPES = {
+    "fp8xfp8": "fp8xfp8",
     "mxf4xmxf4": "fp4xfp4",
     "fp8xmxfp4": "fp8xfp4",
     "bf16xmxfp4": "bf16xfp4",
 }
 logger = init_logger(__name__)
+
+
+def _fp8_channelwise_config(quant_config, prefix, experts):
+    from compressed_tensors.quantization import QuantizationStrategy, QuantizationType
+
+    scheme = quant_config.get_scheme_dict(experts, layer_name=prefix)
+    if scheme is None:
+        scheme = quant_config.target_scheme_map.get("RoutedExperts")
+    if scheme is None:
+        scheme = quant_config.target_scheme_map.get("Linear", {})
+    weight, activation = scheme.get("weights"), scheme.get("input_activations")
+    return (
+        weight is not None
+        and activation is not None
+        and weight.type == activation.type == QuantizationType.FLOAT
+        and weight.num_bits == activation.num_bits == 8
+        and weight.symmetric
+        and activation.symmetric
+        and not weight.dynamic
+        and activation.dynamic
+        and weight.strategy == QuantizationStrategy.CHANNEL
+        and activation.strategy == QuantizationStrategy.TOKEN
+    )
 
 
 class PPUStep5BF16MoERunner(MoERunner):
@@ -96,6 +121,9 @@ class PPUStep5MegaMoEExperts(PPUDeepGemmMegaMoEExperts):
         from vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe import (
             MEGA_MOE_MXFP4,
         )
+        from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
+            CompressedTensorsConfig,
+        )
         from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4Config
 
         parallel = vllm_config.parallel_config
@@ -105,8 +133,18 @@ class PPUStep5MegaMoEExperts(PPUDeepGemmMegaMoEExperts):
             raise ValueError("SAIL Step5 MegaMoE does not support EPLB")
         if parallel.enable_dbo or getattr(parallel, "ubatch_size", 1) > 1:
             raise ValueError("SAIL Step5 MegaMoE requires serial microbatches")
-        if not isinstance(quant_config, Mxfp4Config):
-            raise ValueError("SAIL Step5 MegaMoE requires MXFP4 weights")
+        if isinstance(quant_config, Mxfp4Config):
+            weight_format = MEGA_MOE_MXFP4
+        elif isinstance(quant_config, CompressedTensorsConfig) and (
+            _fp8_channelwise_config(quant_config, prefix, self)
+        ):
+            if not 1 <= top_k <= 16:
+                raise ValueError("Step5 FP8 MegaMoE requires top-k in [1, 16]")
+            weight_format = _FP8_CHANNELWISE
+        else:
+            raise ValueError(
+                "SAIL Step5 MegaMoE requires MXFP4 or channelwise FP8 weights"
+            )
         if activation not in ("silu", "swiglustep"):
             raise ValueError(f"Unsupported Step5 MegaMoE activation: {activation}")
         if activation == "swiglustep" and activation_clamp != 7.0:
@@ -124,7 +162,7 @@ class PPUStep5MegaMoEExperts(PPUDeepGemmMegaMoEExperts):
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             activation=SimpleNamespace(name="swiglu", clamp=activation_clamp),
-            weight_format=MEGA_MOE_MXFP4,
+            weight_format=weight_format,
             max_num_tokens=max_num_tokens,
             prefix=prefix,
         )
@@ -157,6 +195,11 @@ class PPUStep5MegaMoEExperts(PPUDeepGemmMegaMoEExperts):
         if not self.ready:
             api = mega_moe_api(self.mma_type)
             weights = self._kernel_weights(api)
+            if self.mma_type == "fp8xfp8":
+                # Release checkpoint-layout banks after the one-time transform.
+                for bank, (weight, scale) in zip(("w13", "w2"), weights, strict=True):
+                    getattr(self, f"{bank}_weight").data = weight
+                    getattr(self, f"{bank}_weight_scale").data = scale
             if self.ultra_ep_requested:
                 self._prepare_ultra_ep(api, weights)
             self.ready = True
@@ -229,6 +272,44 @@ class PPUStep5MegaMoEExperts(PPUDeepGemmMegaMoEExperts):
             replace_parameter(self, f"{bank}_weight", weight)
             replace_parameter(self, f"{bank}_weight_scale", scale)
         logger.info_once("Step5 UltraEP replica weights enabled", scope="process")
+
+    def _resolve_mma_type(self, weight_format):
+        if weight_format == _FP8_CHANNELWISE:
+            return "fp8xfp8"
+        return super()._resolve_mma_type(weight_format)
+
+    def _register_weight(self, name, shape, spec):
+        if self.mma_type != "fp8xfp8":
+            return super()._register_weight(name, shape, spec)
+        experts, rows, _ = shape
+        self.register_parameter(
+            f"{name}_weight",
+            torch.nn.Parameter(
+                torch.empty(shape, dtype=torch.float8_e4m3fn), requires_grad=False
+            ),
+        )
+        self.register_parameter(
+            f"{name}_weight_scale",
+            torch.nn.Parameter(
+                torch.empty((experts, rows, 1), dtype=torch.float32),
+                requires_grad=False,
+            ),
+        )
+
+    def _load_weight(self, dst, src, shard_id, is_scale):
+        if self.mma_type != "fp8xfp8":
+            return super()._load_weight(dst, src, shard_id, is_scale)
+        if shard_id != "w2":
+            dst = dst.chunk(2, dim=0)[0 if shard_id == "w1" else 1]
+        if is_scale and src.ndim == 1:
+            src = src.unsqueeze(-1)
+        if src.shape != dst.shape or src.dtype != dst.dtype:
+            raise ValueError(
+                f"Invalid Step5 FP8 {shard_id} tensor: expected "
+                f"{tuple(dst.shape)} {dst.dtype}, got {tuple(src.shape)} {src.dtype}"
+            )
+        dst.copy_(src)
+        self._transformed_weights = None
 
     def weight_loader(
         self,

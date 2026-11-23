@@ -6,12 +6,12 @@ import pytest
 pytestmark = [pytest.mark.ppu, pytest.mark.cap89]
 
 
-@pytest.mark.parametrize("mode", ["mxf4xmxf4", "fp8xmxfp4"])
+@pytest.mark.parametrize("mode", ["mxf4xmxf4", "fp8xmxfp4", "fp8xfp8"])
 @pytest.mark.parametrize("tokens", [0, 3, 17])
-def test_step5_mxfp4_swiglu_step_kernel_and_padding(
+def test_step5_swiglu_step_kernel_and_padding(
     monkeypatch, tmp_path, mode, tokens
 ):
-    """Raw MXFP4 weights, Step activations and routing weights keep kernel semantics."""
+    """Expert weights, Step activation and routing weights keep kernel semantics."""
     from types import SimpleNamespace
 
     import torch
@@ -24,7 +24,28 @@ def test_step5_mxfp4_swiglu_step_kernel_and_padding(
 
     from vllm_sail.models.step5 import mega_moe
 
-    monkeypatch.setenv("VLLM_SAIL_MEGA_MOE_MMA_TYPE", mode)
+    quant_config = Mxfp4Config()
+    if mode == "fp8xfp8":
+        from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
+            CompressedTensorsConfig,
+        )
+
+        common = {"num_bits": 8, "type": "float", "symmetric": True}
+        quant_config = CompressedTensorsConfig.from_config(
+            {
+                "format": "float-quantized",
+                "config_groups": {
+                    "experts": {
+                        "targets": ["Linear"],
+                        "weights": common | {"strategy": "channel", "dynamic": False},
+                        "input_activations": common
+                        | {"strategy": "token", "dynamic": True},
+                    },
+                },
+            }
+        )
+    else:
+        monkeypatch.setenv("VLLM_SAIL_MEGA_MOE_MMA_TYPE", mode)
     torch.cuda.set_device(0)
     dist.init_process_group(
         "nccl",
@@ -37,12 +58,15 @@ def test_step5_mxfp4_swiglu_step_kernel_and_padding(
         mega_moe, "get_ep_group", lambda: SimpleNamespace(device_group=group)
     )
     config = SimpleNamespace(
+        kv_transfer_config=None,
+        speculative_config=None,
         parallel_config=SimpleNamespace(
             enable_expert_parallel=True,
             enable_eplb=False,
             eplb_config=SimpleNamespace(num_redundant_experts=0),
             enable_dbo=False,
             tensor_parallel_size=4,
+            data_parallel_size=1,
             pipeline_parallel_size=2,
         ),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=32),
@@ -57,7 +81,7 @@ def test_step5_mxfp4_swiglu_step_kernel_and_padding(
                 top_k=2,
                 hidden_size=h,
                 intermediate_size=i,
-                quant_config=Mxfp4Config(),
+                quant_config=quant_config,
                 activation="swiglustep",
                 activation_clamp=7.0,
                 prefix="model.layers.3.moe.experts.routed_experts",
@@ -70,16 +94,24 @@ def test_step5_mxfp4_swiglu_step_kernel_and_padding(
                 width = h if name.startswith("w13") else i
                 rows = 2 * i if name.startswith("w13") else h
                 scale = name.endswith("scale")
-                raw = torch.full(
-                    (e, rows, width // (32 if scale else 2)),
-                    0x78 if scale else 0x22,
-                    dtype=torch.uint8,
-                )
+                if mode == "fp8xfp8":
+                    raw = (
+                        torch.full((e, rows), 1 / 128, dtype=torch.float32)
+                        if scale
+                        else torch.ones(e, rows, width).to(torch.float8_e4m3fn)
+                    )
+                else:
+                    raw = torch.full(
+                        (e, rows, width // (32 if scale else 2)),
+                        0x78 if scale else 0x22,
+                        dtype=torch.uint8,
+                    )
                 assert layer.weight_loader(param, raw, return_success=True)
         monkeypatch.setattr(
             layer, "_synchronize_first_launch", lambda: dist.barrier(group=group)
         )
         layer.prepare_weights()
+        assert layer.mma_type == mode
         if mode == "fp8xmxfp4":
             assert all(len(bank) == 3 for bank in layer._transformed_weights)
         output = layer(hidden, weights, ids, padding)

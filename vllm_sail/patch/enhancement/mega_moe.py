@@ -66,7 +66,9 @@ def _install_step5():
     from vllm.config import set_current_vllm_config
     from vllm.model_executor.layers.fused_moe import FusedMoEFactory
     from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4Config
-    from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        is_layer_skipped,
+    )
     from vllm.models.step5.nvidia import mega_moe, model
     from vllm.platforms import current_platform
 
@@ -78,7 +80,7 @@ def _install_step5():
     original = mega_moe.Step5MegaMoE
     original_sp = model._step5_use_sequence_parallel
     metadata = dict(
-        reason="Step5 needs SAIL MXFP4 MegaMoE and stage-local sequence parallelism for PP.",
+        reason="Step5 needs SAIL MegaMoE and stage-local sequence parallelism for PP.",
         affected_versions=_AFFECTED,
         remove_when="Step5 exposes out-of-tree MegaMoE experts and enables stage-local SP with PP.",
     )
@@ -107,6 +109,33 @@ def _install_step5():
             )
             for candidate in (prefix, f"{prefix}.routed_experts")
         )
+        if getattr(quant, "get_name", lambda: None)() == "compressed-tensors":
+            from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
+                should_ignore_layer,
+            )
+
+            routed_prefix = f"{prefix}.routed_experts"
+            gate_up_ignored, down_ignored = (
+                any(
+                    should_ignore_layer(
+                        f"{candidate}.{bank}",
+                        ignore=quant.ignore,
+                        fused_mapping=quant.packed_modules_mapping,
+                    )
+                    for candidate in (prefix, routed_prefix)
+                )
+                for bank in ("w13_weight", "w2_weight")
+            )
+            if gate_up_ignored != down_ignored:
+                raise ValueError(f"Step5 requires both expert banks to match: {prefix}")
+            ignored = gate_up_ignored or any(
+                should_ignore_layer(
+                    candidate,
+                    ignore=quant.ignore,
+                    fused_mapping=quant.packed_modules_mapping,
+                )
+                for candidate in (prefix, routed_prefix)
+            )
         if not ignored:
             return original(vllm_config, **kwargs)
         # BF16 tail layers from the checkpoint are not requantized, and no
