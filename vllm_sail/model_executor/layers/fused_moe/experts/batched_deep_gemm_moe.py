@@ -712,6 +712,7 @@ def _silu_mul_mxfp4_quant_deep_gemm(
     ALPHA: tl.constexpr,
     BETA: tl.constexpr,
     IS_SITU: tl.constexpr,
+    IS_SWIGLUSTEP: tl.constexpr,
     SITU_BETA: tl.constexpr,
     SITU_LINEAR_BETA: tl.constexpr,
 ):
@@ -778,11 +779,16 @@ def _silu_mul_mxfp4_quant_deep_gemm(
         ).to(tl.float32)
 
         # -- Clamp: gate at max only, up both ways (matches C++ reference) --
-        if not IS_SITU and SWIGLU_LIMIT > 0.0:
+        if not IS_SITU and not IS_SWIGLUSTEP and SWIGLU_LIMIT > 0.0:
             gate = tl.minimum(gate, SWIGLU_LIMIT)
             up = tl.clamp(up, -SWIGLU_LIMIT, SWIGLU_LIMIT)
 
-        if IS_SITU:
+        if IS_SWIGLUSTEP:
+            # Preserve the activation store's BF16 rounding before quantizing.
+            gate_silu = tl.sigmoid(gate) * gate
+            gate_up = tl.minimum(gate_silu, 7.0) * tl.clamp(up, -7.0, 7.0)
+            gate_up = gate_up.to(input_ptr.dtype.element_ty).to(tl.float32)
+        elif IS_SITU:
             # -- SITU (Kimi SituGLU): beta * tanh(gate / beta) * sigmoid(gate)
             #    times (linear_beta * tanh(up / linear_beta) if set, else up) --
             gate_out = (
@@ -874,8 +880,10 @@ def silu_mul_mxfp4_quant_masked(
     is_situ: bool = False,
     situ_beta: float = 1.0,
     situ_linear_beta: float = -1.0,
+    *,
+    is_swiglustep: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fused SiLU/SITU+mul + MXFP4 quantisation (masked / batched-expert layout).
+    """Fused gated activation and MXFP4 quantization for batched experts.
 
     Args:
         y: Activations tensor of shape ``(E, T, 2*H)`` in bf16.  The first
@@ -890,6 +898,7 @@ def silu_mul_mxfp4_quant_masked(
         situ_linear_beta: SITU ``linear_beta`` parameter. Defaults to ``-1.0``
            when unset; any non-positive value leaves the up projection
            unchanged.
+        is_swiglustep: Apply Step5 activation with its fixed clamp of 7.0.
 
     Returns:
         Tuple ``(y_q, y_s)`` where:
@@ -962,6 +971,7 @@ def silu_mul_mxfp4_quant_masked(
         ALPHA=alpha,
         BETA=beta,
         IS_SITU=is_situ,
+        IS_SWIGLUSTEP=is_swiglustep,
         SITU_BETA=situ_beta,
         SITU_LINEAR_BETA=situ_linear_beta,
         num_warps=1,
@@ -1574,11 +1584,12 @@ class PPUBatchedDeepGemmExpertsMXFP4(mk.FusedMoEExpertsModular):
         activation_out_dim = self.adjust_N_for_activation(N, activation)
 
         # SiLU/SITU+mul on (E, T, 2*H) -> (E, T, H//2) uint8 + scales, fused with
-        # mxfp4 quantisation.  The fused Triton kernel supports SILU,
+        # mxfp4 quantisation.  The fused Triton kernel supports SILU, SWIGLUSTEP,
         # SWIGLUOAI_UNINTERLEAVE (with clamp/alpha/beta) and SITU; other
         # activation variants fall back to a two-step approach.
         if activation in (
             MoEActivation.SILU,
+            MoEActivation.SWIGLUSTEP,
             MoEActivation.SWIGLUOAI_UNINTERLEAVE,
             MoEActivation.SITU,
         ):
@@ -1591,6 +1602,7 @@ class PPUBatchedDeepGemmExpertsMXFP4(mk.FusedMoEExpertsModular):
                 is_situ=(activation == MoEActivation.SITU),
                 situ_beta=self.activation_situ_beta,
                 situ_linear_beta=self.activation_situ_linear_beta,
+                is_swiglustep=(activation == MoEActivation.SWIGLUSTEP),
             )
             # silu_mul_mxfp4_quant_masked outputs scale in [E, H//32//2, T] layout.
             # fp4_m_grouped_gemm_nt_masked expects [E, T, H//32//2], so permute.
