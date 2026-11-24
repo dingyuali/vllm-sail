@@ -45,6 +45,10 @@ if TYPE_CHECKING:
     VLLM_SAIL_FORCE_MOE_WNA16_CUDA: bool = False
     VLLM_SAIL_ENABLE_MOE_MARLIN: bool = False
     VLLM_SAIL_MEGA_MOE_MMA_TYPE: str = "fp8xmxfp4"
+    VLLM_SAIL_STEP5_MEGA_MOE_OVERLAP: bool = True
+    VLLM_SAIL_MEGA_MOE_ULTRA_EP: bool = False
+    VLLM_SAIL_MEGA_MOE_ULTRA_EP_MIN_TOKENS: int = 256
+    VLLM_SAIL_MEGA_MOE_ULTRA_EP_REDUNDANT_EXPERTS: int = 2
     VLLM_SAIL_DISABLE_MEGA_MHC: bool = False
     VLLM_SAIL_USE_TRITON_INT8_QUANT: bool = True
     VLLM_SAIL_FP8_LOAD_POLICY: str | None = None
@@ -55,8 +59,14 @@ if TYPE_CHECKING:
     VLLM_SAIL_STEP5_DSA_SCORE_MAX_BYTES: int = 1 << 30
     VLLM_SAIL_STEP5_DSA_SCORE_DECODE: str = "v0"
     VLLM_SAIL_STEP5_JOINT_PREPARE: bool = False
+    VLLM_SAIL_STEP5_QKNORM_ROPE_CACHEKV: bool = True
+    VLLM_SAIL_STEP5_FUSED_ROUTER: bool = True
+    VLLM_SAIL_STEP5_INDEXER_PER_TOKEN: bool = True
+    VLLM_SAIL_STEP5_FUSE_DP_COORDINATION: bool = False
     VLLM_SAIL_STEP5_DSA_SELECTOR_PPU: bool = False
     VLLM_SAIL_STEP5_DSA_PREFILL_PPU: bool = False
+    VLLM_SAIL_STEP5_DSA_PREFILL_QUERY_TILE: int = 0
+    VLLM_SAIL_STEP5_DSA_PREFILL_FP8: bool = False
     VLLM_SAIL_STEP5_DSA_PREFILL_BACKEND: str = "flashinfer"
     VLLM_SAIL_STEP5_DSA_PREFILL_BATCH_ATTENTION: bool = True
     VLLM_STEP5_INDEXER_FP8_AS_FP16: bool = False
@@ -94,8 +104,14 @@ if TYPE_CHECKING:
     VLLM_PPU_STEP5_DSA_SCORE_MAX_BYTES: int = 1 << 30
     VLLM_PPU_STEP5_DSA_SCORE_DECODE: str = "v0"
     VLLM_PPU_STEP5_JOINT_PREPARE: bool = False
+    VLLM_PPU_STEP5_QKNORM_ROPE_CACHEKV: bool = True
+    VLLM_PPU_STEP5_FUSED_ROUTER: bool = True
+    VLLM_PPU_STEP5_INDEXER_PER_TOKEN: bool = True
+    VLLM_PPU_STEP5_FUSE_DP_COORDINATION: bool = False
     VLLM_PPU_STEP5_DSA_SELECTOR_PPU: bool = False
     VLLM_PPU_STEP5_DSA_PREFILL_PPU: bool = False
+    VLLM_PPU_STEP5_DSA_PREFILL_QUERY_TILE: int = 0
+    VLLM_PPU_STEP5_DSA_PREFILL_FP8: bool = False
     VLLM_PPU_STEP5_DSA_PREFILL_BACKEND: str = "flashinfer"
     VLLM_PPU_STEP5_DSA_PREFILL_BATCH_ATTENTION: bool = True
     VLLM_PPU_NVTX_PROFILE: bool = False
@@ -253,6 +269,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Legacy Marlin selection gate. Native Marlin execution remains excluded
     # by the CUDA-free manifest; this flag cannot supply those kernels.
     "VLLM_SAIL_ENABLE_MOE_MARLIN": _bool("VLLM_SAIL_ENABLE_MOE_MARLIN", False),
+    "VLLM_SAIL_STEP5_MEGA_MOE_OVERLAP": _bool("VLLM_SAIL_STEP5_MEGA_MOE_OVERLAP", True),
+    "VLLM_SAIL_MEGA_MOE_ULTRA_EP": _bool("VLLM_SAIL_MEGA_MOE_ULTRA_EP", False),
+    "VLLM_SAIL_MEGA_MOE_ULTRA_EP_MIN_TOKENS": _int(
+        "VLLM_SAIL_MEGA_MOE_ULTRA_EP_MIN_TOKENS", 256
+    ),
+    "VLLM_SAIL_MEGA_MOE_ULTRA_EP_REDUNDANT_EXPERTS": _int(
+        "VLLM_SAIL_MEGA_MOE_ULTRA_EP_REDUNDANT_EXPERTS", 2
+    ),
     "VLLM_SAIL_MEGA_MOE_MMA_TYPE": _choice(
         "VLLM_SAIL_MEGA_MOE_MMA_TYPE", "fp8xmxfp4", MEGA_MOE_MMA_TYPES
     ),
@@ -284,6 +308,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_SAIL_KPOOL_MAX_DENSE_POOLS", 1 << 21
     ),
     # -- Step5 DSA ----------------------------------------------------------
+    "VLLM_SAIL_STEP5_FUSED_ROUTER": _bool("VLLM_SAIL_STEP5_FUSED_ROUTER", True),
+    "VLLM_SAIL_STEP5_INDEXER_PER_TOKEN": _bool(
+        "VLLM_SAIL_STEP5_INDEXER_PER_TOKEN", True
+    ),
+    "VLLM_SAIL_STEP5_FUSE_DP_COORDINATION": _bool(
+        "VLLM_SAIL_STEP5_FUSE_DP_COORDINATION", False
+    ),
+    "VLLM_SAIL_STEP5_QKNORM_ROPE_CACHEKV": _bool(
+        "VLLM_SAIL_STEP5_QKNORM_ROPE_CACHEKV", True
+    ),
     # Prefill: v0 keeps upstream, v1 uses resident, v2 prefers compact, and
     # v3 forces chunks with grouped H4 enabled.
     "VLLM_SAIL_STEP5_DSA_SCORES": _choice(
@@ -302,6 +336,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SAIL_STEP5_DSA_SELECTOR_PPU": _bool(
         "VLLM_SAIL_STEP5_DSA_SELECTOR_PPU", False
     ),
+    "VLLM_SAIL_STEP5_DSA_PREFILL_QUERY_TILE": _int(
+        "VLLM_SAIL_STEP5_DSA_PREFILL_QUERY_TILE", 0
+    ),
+    "VLLM_SAIL_STEP5_DSA_PREFILL_FP8": _bool("VLLM_SAIL_STEP5_DSA_PREFILL_FP8", False),
     # Selects native paged attention during prefill metadata planning.
     "VLLM_SAIL_STEP5_DSA_PREFILL_PPU": _bool("VLLM_SAIL_STEP5_DSA_PREFILL_PPU", False),
     # Defaults to FlashInfer; native opts into the new prefill/decode and the old
@@ -391,6 +429,7 @@ _aliases: dict[str, tuple[str, ...]] = {
 }
 _aliases["VLLM_SAIL_NVTX_PROFILE"] += ("SAIL_NVTX_PROFILE",)
 _aliases["VLLM_SAIL_DISABLE_MEGA_MHC"] += ("SAIL_DISABLE_MEGA_MHC",)
+_aliases["VLLM_SAIL_STEP5_DSA_PREFILL_FP8"] += ("VLLM_STEP5_DSA_PREFILL_FP8",)
 _canonical_names = {
     alias: name for name, aliases in _aliases.items() for alias in aliases
 }

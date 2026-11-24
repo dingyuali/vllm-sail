@@ -135,6 +135,24 @@ def select_regions(
         threads=threads,
     )
     scratch = torch.empty((rows, k + 1), device=scores.device, dtype=torch.int32)
+    # Long prefill uses 4096-row score chunks and a 3072-row tail at MBT 11264.
+    if paged_prefill is None and 3072 <= rows <= 4096 and k == 512 and regions <= 8192:
+        from .selector_prefill import _stable_prefill_regions
+
+        _stable_prefill_regions[(rows,)](
+            scores,
+            current,
+            candidates,
+            scratch,
+            output,
+            scores.stride(0),
+            regions,
+            k,
+            512,
+            1024,
+            triton.next_power_of_2(regions),
+        )
+        return output
     page_kwargs = {}
     if paged_prefill is not None:
         page_kwargs = dict(

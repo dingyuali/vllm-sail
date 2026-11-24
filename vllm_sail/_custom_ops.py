@@ -124,6 +124,13 @@ def step5_dsa_native_op(kind: str):
     return op
 
 
+def step5_dsa_fp8_prefill_op():
+    """Return the optional compiled FP8 prefill op."""
+    if _ext_loaded("_C"):
+        return getattr(torch.ops._ppu_C, "step5_dsa_fp8_prefill", None)
+    return None
+
+
 def step5_dsa_selector_v2(scores, positions, table, workspace, regions, starts,
                           region_block, page_size, topk, packed, threads) -> None:
     """Step5 selector v2 raw candidate selection (prebuilt op)."""

@@ -14,10 +14,13 @@ Step5 DSA indexer scoring kernel.
 
 from vllm_sail.patch.performance import fla  # noqa: F401
 from vllm_sail.patch.performance import qsa_select_config
+from vllm_sail.patch.performance import step5_dp_coordination  # noqa: F401
 from vllm_sail.patch.performance import step5_dsa  # noqa: F401
 from vllm_sail.patch.performance import step5_dsa_selector  # noqa: F401
 from vllm_sail.patch.performance import step5_dsa_prefill  # noqa: F401
+from vllm_sail.patch.performance import step5_fused_router  # noqa: F401
 from vllm_sail.patch.performance import step5_norm  # noqa: F401
+from vllm_sail.patch.performance import step5_qknorm_rope_cache  # noqa: F401
 
 # Leaf-style module (like enhancement/mxfp4): defines its replacement without
 # vLLM imports at module scope, so installation is explicit.

@@ -1,31 +1,63 @@
 # SPDX-License-Identifier: Apache-2.0
-"""SAIL MXFP4 MegaMoE expert adaptation for Step5."""
+"""SAIL MegaMoE expert adaptation for Step5."""
 
 from contextlib import nullcontext
 from copy import copy
+from inspect import signature
 from types import SimpleNamespace
 
 import torch
+from vllm.config import CUDAGraphMode
 from vllm.distributed import get_ep_group, get_tensor_model_parallel_world_size
 from vllm.forward_context import (
     get_forward_context,
     is_forward_context_available,
     override_forward_context,
 )
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+from vllm.model_executor.models.utils import extract_layer_index
+from vllm.model_executor.utils import replace_parameter
 from vllm.models.common.ops.sequence_parallel import sp_all_gather, sp_shard
 from vllm.models.step5.nvidia.mega_moe import _MegaMoEMethod
 
+from vllm_sail import envs
 from vllm_sail.model_executor.layers.fused_moe.experts.deep_gemm_mega_moe import (
     PPUDeepGemmMegaMoEExperts,
 )
 from vllm_sail.utils.deep_gemm_mega import mega_moe_api
 
+_FP8_CHANNELWISE = "fp8_channelwise"
 _MMA_TYPES = {
+    "fp8xfp8": "fp8xfp8",
     "mxf4xmxf4": "fp4xfp4",
     "fp8xmxfp4": "fp8xfp4",
     "bf16xmxfp4": "bf16xfp4",
 }
+logger = init_logger(__name__)
+
+
+def _fp8_channelwise_config(quant_config, prefix, experts):
+    from compressed_tensors.quantization import QuantizationStrategy, QuantizationType
+
+    scheme = quant_config.get_scheme_dict(experts, layer_name=prefix)
+    if scheme is None:
+        scheme = quant_config.target_scheme_map.get("RoutedExperts")
+    if scheme is None:
+        scheme = quant_config.target_scheme_map.get("Linear", {})
+    weight, activation = scheme.get("weights"), scheme.get("input_activations")
+    return (
+        weight is not None
+        and activation is not None
+        and weight.type == activation.type == QuantizationType.FLOAT
+        and weight.num_bits == activation.num_bits == 8
+        and weight.symmetric
+        and activation.symmetric
+        and not weight.dynamic
+        and activation.dynamic
+        and weight.strategy == QuantizationStrategy.CHANNEL
+        and activation.strategy == QuantizationStrategy.TOKEN
+    )
 
 
 class PPUStep5BF16MoERunner(MoERunner):
@@ -89,6 +121,9 @@ class PPUStep5MegaMoEExperts(PPUDeepGemmMegaMoEExperts):
         from vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe import (
             MEGA_MOE_MXFP4,
         )
+        from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
+            CompressedTensorsConfig,
+        )
         from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4Config
 
         parallel = vllm_config.parallel_config
@@ -98,8 +133,18 @@ class PPUStep5MegaMoEExperts(PPUDeepGemmMegaMoEExperts):
             raise ValueError("SAIL Step5 MegaMoE does not support EPLB")
         if parallel.enable_dbo or getattr(parallel, "ubatch_size", 1) > 1:
             raise ValueError("SAIL Step5 MegaMoE requires serial microbatches")
-        if not isinstance(quant_config, Mxfp4Config):
-            raise ValueError("SAIL Step5 MegaMoE requires MXFP4 weights")
+        if isinstance(quant_config, Mxfp4Config):
+            weight_format = MEGA_MOE_MXFP4
+        elif isinstance(quant_config, CompressedTensorsConfig) and (
+            _fp8_channelwise_config(quant_config, prefix, self)
+        ):
+            if not 1 <= top_k <= 16:
+                raise ValueError("Step5 FP8 MegaMoE requires top-k in [1, 16]")
+            weight_format = _FP8_CHANNELWISE
+        else:
+            raise ValueError(
+                "SAIL Step5 MegaMoE requires MXFP4 or channelwise FP8 weights"
+            )
         if activation not in ("silu", "swiglustep"):
             raise ValueError(f"Unsupported Step5 MegaMoE activation: {activation}")
         if activation == "swiglustep" and activation_clamp != 7.0:
@@ -117,7 +162,7 @@ class PPUStep5MegaMoEExperts(PPUDeepGemmMegaMoEExperts):
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             activation=SimpleNamespace(name="swiglu", clamp=activation_clamp),
-            weight_format=MEGA_MOE_MXFP4,
+            weight_format=weight_format,
             max_num_tokens=max_num_tokens,
             prefix=prefix,
         )
@@ -127,11 +172,144 @@ class PPUStep5MegaMoEExperts(PPUDeepGemmMegaMoEExperts):
         self.quant_method = _MegaMoEMethod()
         self.ready = False
         self.pool = None
+        self.replica_pool = None
+        self.ultra_ep = None
+        transfer = vllm_config.kv_transfer_config
+        self.ultra_ep_requested = (
+            envs.VLLM_SAIL_MEGA_MOE_ULTRA_EP
+            and self.mma_type == "mxf4xmxf4"
+            and parallel.data_parallel_size == 1
+            and vllm_config.speculative_config is None
+            and (
+                transfer is None
+                or transfer.kv_connector is None
+                or transfer.kv_role == "kv_producer"
+            )
+        )
+        self.ultra_ep_min_tokens = envs.VLLM_SAIL_MEGA_MOE_ULTRA_EP_MIN_TOKENS
+        if self.ultra_ep_requested:
+            self._ultra_ep_compilation = vllm_config.compilation_config
+            self._ultra_ep_sp_size = parallel.tensor_parallel_size
 
     def prepare_weights(self):
         if not self.ready:
-            self._kernel_weights(mega_moe_api(self.mma_type))
+            api = mega_moe_api(self.mma_type)
+            weights = self._kernel_weights(api)
+            if self.mma_type == "fp8xfp8":
+                # Release checkpoint-layout banks after the one-time transform.
+                for bank, (weight, scale) in zip(("w13", "w2"), weights, strict=True):
+                    getattr(self, f"{bank}_weight").data = weight
+                    getattr(self, f"{bank}_weight_scale").data = scale
+            if self.ultra_ep_requested:
+                self._prepare_ultra_ep(api, weights)
             self.ready = True
+
+    def _ultra_ep_compilation_rejection(self):
+        compilation = self._ultra_ep_compilation
+        mode = compilation.cudagraph_mode
+        if mode not in (
+            CUDAGraphMode.NONE,
+            CUDAGraphMode.PIECEWISE,
+            CUDAGraphMode.FULL_AND_PIECEWISE,
+        ):
+            return "prefill requires eager or piecewise CUDA graphs"
+        if mode != CUDAGraphMode.NONE:
+            capture = max(
+                compilation.max_cudagraph_capture_size or 0,
+                max(compilation.cudagraph_capture_sizes or [0]),
+            )
+            local_capture = (
+                capture + self._ultra_ep_sp_size - 1
+            ) // self._ultra_ep_sp_size
+            if local_capture >= self.ultra_ep_min_tokens:
+                return "MIN_TOKENS must exceed the largest local CUDA graph capture"
+        return None
+
+    def _prepare_ultra_ep(self, api, weights):
+        from vllm_sail.models.step5.ultra_ep import (
+            PPUMegaMoEUltraEP,
+            all_ranks_supported,
+            available,
+        )
+
+        group = get_ep_group()
+        kernel = getattr(api, self.mma_format.kernel)
+        supported = False
+        if available():
+            try:
+                supported = {"l1_weights_replicas", "l2_weights_replicas"} <= signature(
+                    kernel
+                ).parameters.keys()
+            except (TypeError, ValueError):
+                pass
+        if supported:
+            reason = self._ultra_ep_compilation_rejection()
+            if reason:
+                logger.info_once("Step5 UltraEP disabled: %s", reason, scope="process")
+                supported = False
+        if not all_ranks_supported(group, supported):
+            logger.info_once(
+                "Step5 UltraEP unavailable; using regular MegaMoE", scope="process"
+            )
+            return
+        redundant = envs.VLLM_SAIL_MEGA_MOE_ULTRA_EP_REDUNDANT_EXPERTS
+        if (
+            self.ultra_ep_min_tokens <= 0
+            or redundant <= 0
+            or self.num_local_experts + redundant > 128
+            or (self.num_local_experts + redundant) * group.world_size > 2048
+        ):
+            raise ValueError("Invalid Step5 UltraEP token threshold or replica count")
+        self.ultra_ep = PPUMegaMoEUltraEP(
+            group.device_group, extract_layer_index(self.prefix), *weights, redundant
+        )
+        # These banks keep the original logical layout for ordinary MegaMoE.
+        # Replace weights after registration to release the original allocation.
+        for bank, (weight, scale) in (
+            ("w13", self.ultra_ep.l1_weights),
+            ("w2", self.ultra_ep.l2_weights),
+        ):
+            replace_parameter(self, f"{bank}_weight", weight)
+            replace_parameter(self, f"{bank}_weight_scale", scale)
+        logger.info_once("Step5 UltraEP replica weights enabled", scope="process")
+
+    def _resolve_mma_type(self, weight_format):
+        if weight_format == _FP8_CHANNELWISE:
+            return "fp8xfp8"
+        return super()._resolve_mma_type(weight_format)
+
+    def _register_weight(self, name, shape, spec):
+        if self.mma_type != "fp8xfp8":
+            return super()._register_weight(name, shape, spec)
+        experts, rows, _ = shape
+        self.register_parameter(
+            f"{name}_weight",
+            torch.nn.Parameter(
+                torch.empty(shape, dtype=torch.float8_e4m3fn), requires_grad=False
+            ),
+        )
+        self.register_parameter(
+            f"{name}_weight_scale",
+            torch.nn.Parameter(
+                torch.empty((experts, rows, 1), dtype=torch.float32),
+                requires_grad=False,
+            ),
+        )
+
+    def _load_weight(self, dst, src, shard_id, is_scale):
+        if self.mma_type != "fp8xfp8":
+            return super()._load_weight(dst, src, shard_id, is_scale)
+        if shard_id != "w2":
+            dst = dst.chunk(2, dim=0)[0 if shard_id == "w1" else 1]
+        if is_scale and src.ndim == 1:
+            src = src.unsqueeze(-1)
+        if src.shape != dst.shape or src.dtype != dst.dtype:
+            raise ValueError(
+                f"Invalid Step5 FP8 {shard_id} tensor: expected "
+                f"{tuple(dst.shape)} {dst.dtype}, got {tuple(src.shape)} {src.dtype}"
+            )
+        dst.copy_(src)
+        self._transformed_weights = None
 
     def weight_loader(
         self,
@@ -173,18 +351,22 @@ class PPUStep5MegaMoEExperts(PPUDeepGemmMegaMoEExperts):
 
     weight_loader.supports_moe_loading = True
 
-    def get_symm_buffer(self):
-        if self.pool is None:
+    def get_symm_buffer(self, use_replicas=False):
+        pool = self.replica_pool if use_replicas else self.pool
+        if pool is None:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
                     "Warm up Step5 MegaMoE before capturing a CUDA graph"
                 )
             self._synchronize_first_launch()
             group = get_ep_group().device_group
+            num_experts = (
+                self.ultra_ep.num_physical_experts if use_replicas else self.num_experts
+            )
             key = (
                 id(group),
                 torch.cuda.current_device(),
-                self.num_experts,
+                num_experts,
                 self.max_num_tokens,
                 self.top_k,
                 self.hidden_size,
@@ -197,7 +379,7 @@ class PPUStep5MegaMoEExperts(PPUDeepGemmMegaMoEExperts):
                     self.mma_type
                 ).get_symm_buffer_for_mega_moe(
                     group,
-                    self.num_experts,
+                    num_experts,
                     self.max_num_tokens,
                     self.top_k,
                     self.hidden_size,
@@ -205,8 +387,41 @@ class PPUStep5MegaMoEExperts(PPUDeepGemmMegaMoEExperts):
                     mma_type=_MMA_TYPES[self.mma_type],
                     activation=self.activation.name,
                 )
-            self.pool = self._symm_buffers[key]
-        return self.pool
+            pool = self._symm_buffers[key]
+            if use_replicas:
+                self.replica_pool = pool
+            else:
+                self.pool = pool
+        return pool
+
+    def _use_replicas(self, tokens):
+        if (
+            self.ultra_ep is None
+            or tokens < self.ultra_ep_min_tokens
+            or not is_forward_context_available()
+        ):
+            return False
+        context = get_forward_context()
+        if (
+            context.cudagraph_runtime_mode == CUDAGraphMode.FULL
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return False
+        key = "sail_step5_ultra_ep_pure_prefill"
+        if key not in context.additional_kwargs:
+            prefill = False
+            if isinstance(context.attn_metadata, dict):
+                for metadata in context.attn_metadata.values():
+                    if getattr(metadata, "step5_runtime", None) is not None:
+                        count = metadata.num_actual_reqs
+                        starts = metadata.query_start_loc_cpu[: count + 1].tolist()
+                        prefill = all(
+                            b - a > 1
+                            for a, b in zip(starts[:-1], starts[1:], strict=True)
+                        )
+                        break
+            context.additional_kwargs[key] = prefill
+        return context.additional_kwargs[key]
 
     def forward(self, hidden_states, topk_weights, topk_ids, padding=None):
         if not self.ready:
@@ -223,7 +438,16 @@ class PPUStep5MegaMoEExperts(PPUDeepGemmMegaMoEExperts):
             topk_weights = torch.where(padding[:tokens, None], 0, topk_weights)
         api = mega_moe_api(self.mma_type)
         l1, l2 = self._kernel_weights(api)
-        buffer = self.get_symm_buffer()
+        use_replicas = self._use_replicas(tokens)
+        buffer = self.get_symm_buffer(use_replicas)
+        replica_kwargs = {}
+        if use_replicas:
+            logger.info_once("Step5 UltraEP prefill dispatch active", scope="process")
+            topk_ids = self.ultra_ep.prepare_topk(topk_ids.contiguous())
+            replica_kwargs = {
+                "l1_weights_replicas": self.ultra_ep.l1_weights_replicas,
+                "l2_weights_replicas": self.ultra_ep.l2_weights_replicas,
+            }
         x = hidden_states.contiguous()
         api.mega_moe_pre_dispatch(
             x,
@@ -245,6 +469,7 @@ class PPUStep5MegaMoEExperts(PPUDeepGemmMegaMoEExperts):
             activation=self.activation.name,
             activation_clamp=self.activation.clamp,
             fast_math=self.fast_math,
+            **replica_kwargs,
             **({"recipe": (1, 1, 32)} if self.mma_format.transform is None else {}),
         )
         return output

@@ -122,6 +122,14 @@ configuration-derived shapes, not captured serving inputs. ACU counters,
 cold-cache performance, whole-model accuracy and HTTP throughput are not accepted
 by that comparison. The switch remains opt-in.
 
+## Step5 QK Norm, RoPE and KV Cache
+
+Set `VLLM_SAIL_STEP5_QKNORM_ROPE_CACHEKV=1` to enable the Triton cache-write
+fusion on Step5 M890 BF16 inputs with head dimension 192 and rotary dimension
+64 or 192. The default is on. The joint DSA indexer preparation and FP8 KV
+cache paths keep their existing dispatch. Use separate compilation cache
+directories when comparing the setting on and off.
+
 ## Step5 Score
 
 `VLLM_SAIL_STEP5_DSA_SCORES` selects the **prefill** scorer:
@@ -526,3 +534,23 @@ importing ACEXT fails on an unresolved cuBLAS symbol, the plugin preloads
 
 Build-time settings such as `PPU_SDK`, `HGCC`, `CMAKE_HGCC_DIR` and
 `PYTORCH_SAIL_ARCH` are documented in [HGGC kernels](../developer_guide/kernels.md#build-settings).
+
+## Step5 optimization switches
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `VLLM_SAIL_STEP5_FUSED_ROUTER` | `1` | Fuse split-K router reduction and TopK on supported M890 MegaMoE inputs. |
+| `VLLM_SAIL_STEP5_INDEXER_PER_TOKEN` | `1` | Use the per-token norm and RoPE kernel for supported large M890 indexer batches. |
+| `VLLM_SAIL_STEP5_MEGA_MOE_OVERLAP` | `1` | Overlap shared and routed experts for eligible sequence-parallel batches. |
+| `VLLM_SAIL_STEP5_DSA_SELECTOR_PPU` | `0` | Opt in to the native PPU DSA region selector. |
+| `VLLM_SAIL_STEP5_DSA_PREFILL_FP8` | `0` | Opt in to FP8 sparse attention and its KV preparation on supported native prefill inputs. |
+| `VLLM_SAIL_STEP5_DSA_PREFILL_QUERY_TILE` | `0` | Use automatic query tiling for native BF16 prefill. Set `1`, `2`, `4`, or `8` to override it. |
+| `VLLM_SAIL_STEP5_FUSE_DP_COORDINATION` | `0` | Opt in to sharing target metadata with the first Step5 MTP pass. DP ranks check the prediction together before falling back to the regular coordination path. |
+| `VLLM_SAIL_MEGA_MOE_ULTRA_EP` | `0` | Enable optional expert replicas for eligible MXFP4 prefill. Missing UltraEP or incompatible graph settings leave regular MegaMoE active. |
+| `VLLM_SAIL_MEGA_MOE_ULTRA_EP_MIN_TOKENS` | `256` | Minimum local tokens for UltraEP. It must exceed the largest local captured CUDA graph size when CUDA graphs are enabled. |
+| `VLLM_SAIL_MEGA_MOE_ULTRA_EP_REDUNDANT_EXPERTS` | `2` | Number of replica experts per EP rank. |
+
+For disaggregated Step5 DSA, use a supported connector such as
+`MooncakeStoreConnector` or `NixlConnector` with CUDA buffers.
+Ordinary `MooncakeConnector` is rejected by Step5's cache compatibility check.
+Use the same indexer summary storage dtype on the prefill and decode workers.

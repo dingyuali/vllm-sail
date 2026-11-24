@@ -50,9 +50,7 @@ class PPUDeepGemmMegaMoEExperts(DeepGemmMegaMoEExperts):
         max_num_tokens=None,
         prefix="",
     ):
-        if weight_format != MEGA_MOE_MXFP4:
-            raise ValueError("SAIL MegaMoE requires MXFP4 weights.")
-        self.mma_type = sail_envs.VLLM_SAIL_MEGA_MOE_MMA_TYPE
+        self.mma_type = self._resolve_mma_type(weight_format)
         self.mma_format = MEGA_MOE_FORMATS[self.mma_type]
         if activation.name not in self.mma_format.activations:
             raise ValueError(
@@ -105,6 +103,11 @@ class PPUDeepGemmMegaMoEExperts(DeepGemmMegaMoEExperts):
         if prefix in context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         context[prefix] = self
+
+    def _resolve_mma_type(self, weight_format):
+        if weight_format != MEGA_MOE_MXFP4:
+            raise ValueError("SAIL MegaMoE requires MXFP4 weights.")
+        return sail_envs.VLLM_SAIL_MEGA_MOE_MMA_TYPE
 
     @property
     def l1_weights(self):

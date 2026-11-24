@@ -26,9 +26,9 @@ void prefill(const at::Tensor& q, const at::Tensor& cache, const at::Tensor& reg
 void decode(const at::Tensor& q, const at::Tensor& cache, const at::Tensor& regions,
     const at::Tensor& table, const at::Tensor& pos, const at::Tensor& active,
     const at::Tensor& out, double scale, int64_t query_len, bool clear_inactive,
-    const std::optional<at::Tensor>& gate) {
+    const std::optional<at::Tensor>& gate, bool paired) {
   step5_native_checks::decode(q, cache, regions, table, pos, active, out, gate, query_len, scale);
-  step5_native_decode::run(q, cache, regions, table, pos, active, out, gate, query_len, clear_inactive, scale);
+  step5_native_decode::run(q, cache, regions, table, pos, active, out, gate, query_len, clear_inactive, scale, paired);
 }
 }
 TORCH_LIBRARY_FRAGMENT(_ppu_C, m) {
@@ -37,7 +37,7 @@ TORCH_LIBRARY_FRAGMENT(_ppu_C, m) {
         "float scale, int query_tile=0) -> ()");
   m.def("step5_dsa_native_decode(Tensor query, Tensor cache, Tensor regions, Tensor table, "
         "Tensor positions, Tensor active, Tensor(a!) output, float scale, int query_len=1, "
-        "bool clear_inactive=True, Tensor? gate=None) -> ()");
+        "bool clear_inactive=True, Tensor? gate=None, bool paired=True) -> ()");
 }
 TORCH_LIBRARY_IMPL(_ppu_C, CUDA, m) {
   m.impl("step5_dsa_native_prefill", &step5_native_bindings::prefill);

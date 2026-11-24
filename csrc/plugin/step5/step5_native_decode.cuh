@@ -36,6 +36,8 @@ struct Decode {
   }
   float scale;
 };
+#include "step5_native_decode_pairs.cuh"
+
 // Kernel definitions stay visible to both architectures; the arch guards cover
 // device computation only.
 __device__ __forceinline__ float warp_max(float x) {
@@ -344,7 +346,7 @@ template <int Warps, bool Direct = false> void launch(Decode p, hggcStream_t str
 }
 void run(const at::Tensor& q, const at::Tensor& cache, const at::Tensor& regions, const at::Tensor& table,
     const at::Tensor& positions, const at::Tensor& active, const at::Tensor& out,
-    const std::optional<at::Tensor>& gate, int64_t query_len, bool clear_inactive, double scale) {
+    const std::optional<at::Tensor>& gate, int64_t query_len, bool clear_inactive, double scale, bool allow_paired) {
   const int rows = q.size(0), heads = q.size(1);
   if (!rows) return;
   const c10::cuda::CUDAGuard guard(q.device());
@@ -355,15 +357,26 @@ void run(const at::Tensor& q, const at::Tensor& cache, const at::Tensor& regions
   TORCH_CHECK(!single || splits <= kSingleRowMaxSplits, "single-row KV tiles exceed capacity");
   const auto options = q.options().dtype(at::kFloat);
   const int64_t partial_rows = splits > 1 ? int64_t(rows) * heads * splits : 0;
-  auto partial = at::empty({partial_rows, kHeadDim}, options), partial_lse = at::empty({(single ? 2 : 1) * partial_rows}, options);
   Decode p{}; p.kv = paged_kv(cache, table); p.q = reinterpret_cast<const __ppu_bfloat16*>(q.data_ptr());
   p.out = reinterpret_cast<__ppu_bfloat16*>(out.data_ptr()); p.gate = gate ? reinterpret_cast<const __ppu_bfloat16*>(gate->data_ptr()) : nullptr;
   p.regions = regions.data_ptr<int64_t>(); p.positions = positions.data_ptr<int64_t>(); p.active = active.data_ptr<bool>();
-  p.partial = partial.data_ptr<float>(); p.partial_lse = partial_lse.data_ptr<float>();
+
   p.rows = rows; p.heads = heads; p.slots = slots; p.splits = splits; p.groups = cache.size(1); p.rows_per_request = p.groups * query_len;
   p.qs = q.stride(0); p.qh = q.stride(1); p.os = out.stride(0); p.oh = out.stride(1); p.rs = regions.stride(0);
   p.gs = gate ? gate->stride(0) : 0; p.gh = gate ? gate->stride(1) : 0; p.clear_inactive = clear_inactive || gate.has_value(); p.scale = scale;
   const auto stream = get_current_cuda_stream(q.get_device());
+  if (allow_paired && rows == 64 && heads == 16 &&
+      p.groups == 1 && query_len == 4 && slots == 513 &&
+      p.qh == kHeadDim && p.qs % 64 == 0 &&
+      reinterpret_cast<uintptr_t>(p.q) % 128 == 0) {
+    launch_paired(p, options, stream);
+    step5_runtime::check(hggcGetLastError());
+    return;
+  }
+  auto partial = at::empty({partial_rows, kHeadDim}, options);
+  auto partial_lse = at::empty({(single ? 2 : 1) * partial_rows}, options);
+  p.partial = partial.data_ptr<float>();
+  p.partial_lse = partial_lse.data_ptr<float>();
   if (single) launch_single_row(p, stream); else if (rows >= kDirectRows) launch<2, true>(p, stream);
   else if (rows <= kSingleWarpRows) launch<1>(p, stream); else launch<2>(p, stream);
   step5_runtime::check(hggcGetLastError());

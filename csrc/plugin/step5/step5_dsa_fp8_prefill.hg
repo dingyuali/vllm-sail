@@ -1,0 +1,1853 @@
+// SPDX-License-Identifier: Apache-2.0
+// Port of FlashMLA-for-sail D192 FP8 GQA, verified source 45b2044c64e0.
+// Native PPU0015 D192 sparse GQA. Unlike MLA, K and V are independent.
+// Keep region expansion and causal masking on device; no global token-id list.
+#include <ATen/MemoryOverlap.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <climits>
+#include <cmath>
+#include <cstdint>
+#include <hggc_bf16.h>
+#include <hggc_fp8.h>
+#include <hggc_runtime.h>
+#include <limits>
+#include <torch/all.h>
+#include <torch/library.h>
+#include <type_traits>
+#include "step5_dsa/common.h"
+
+/***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights
+ * reserved. Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All
+ * rights reserved. SPDX-License-Identifier: BSD-3-Clause
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice,
+ * this list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ * this list of conditions and the following disclaimer in the documentation
+ * and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its
+ * contributors may be used to endorse or promote products derived from
+ * this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ *
+ **************************************************************************************************/
+// Shared invariants of the supported kernels.
+
+#define DSA_FP8_UNROLL _Pragma("unroll")
+#define DSA_FP8_UNIF(x) ((int)__ppu_read_firstlane((unsigned)(x)))
+#define DSA_FP8_LDM(v, tsm, LBO, SBO)                          \
+  asm volatile(                                                \
+      "ppu.tc02.ldmatrix.swzl.sync.bulk.tensor.m8n8.x4.b16 "   \
+      "{%0, %1, %2, %3}, [%4], %5, %6, %7;"                    \
+      : "=r"((v)[0]), "=r"((v)[1]), "=r"((v)[2]), "=r"((v)[3]) \
+      : "l"(tsm), "r"(LBO), "r"(SBO), "n"(1))
+
+namespace step5_dsa_fp8::detail {
+using E4M3 = __hg_fp8_e4m3;
+struct alignas(16) Vec16 {
+  uint32_t words[4];
+};
+template <int N>
+// Preserve the 16-byte alignment of CuTe's ArrayEngine register storage.
+struct alignas(16) Fragment {
+  float values[N];
+  __device__ float& operator()(int i) { return values[i]; }
+  __device__ const float& operator()(int i) const { return values[i]; }
+};
+template <int N>
+struct alignas(16) HalfFragment {
+  uint32_t values[N / 2];
+};
+template <int N>
+__device__ __forceinline__ void clear(HalfFragment<N>& x) {
+  DSA_FP8_UNROLL
+  for (int i = 0; i < N / 2; ++i) x.values[i] = 0;
+}
+template <int N>
+__device__ __forceinline__ float output_get(const HalfFragment<N>& x, int i) {
+  return __half2float(reinterpret_cast<const __half*>(x.values)[i]);
+}
+template <int N>
+__device__ __forceinline__ void output_scale(Fragment<N>& x, float a0,
+                                             float a1) {
+  DSA_FP8_UNROLL
+  for (int i = 0; i < N; ++i) x(i) *= ((i >> 1) & 1) ? a1 : a0;
+}
+template <int N>
+__device__ __forceinline__ void output_scale(HalfFragment<N>& x, float a0,
+                                             float a1) {
+  const __half2 h0 = __float2half2_rn(a0), h1 = __float2half2_rn(a1);
+  DSA_FP8_UNROLL
+  for (int i = 0; i < N / 2; ++i) {
+    const __half2 value = reinterpret_cast<const __half2*>(x.values)[i];
+    reinterpret_cast<__half2*>(x.values)[i] = __hmul2(value, (i & 1) ? h1 : h0);
+  }
+}
+template <int N>
+__device__ constexpr int size(const Fragment<N>&) {
+  return N;
+}
+template <int N>
+__device__ __forceinline__ void clear(Fragment<N>& x) {
+  DSA_FP8_UNROLL
+  for (int i = 0; i < N; ++i) x(i) = 0.f;
+}
+
+// Equivalent to tile_to_shape(Swizzle<2,4,3>(8x64 row-major), Rows x Dim).
+// The 64-channel slabs are outermost; rows are contiguous within each slab.
+template <int Rows>
+__device__ __forceinline__ int swizzle(int row, int col) {
+  const int offset = (col / 64) * Rows * 64 + row * 64 + col % 64;
+  return offset ^ ((offset >> 3) & 0x30);
+}
+__device__ __forceinline__ int score_row(int e) { return ((e >> 1) & 1) * 8; }
+__device__ __forceinline__ int score_col(int e, int lane, int warp) {
+  return warp * 16 + (lane & 3) * 2 + ((e >> 2) & 1) * 8 + (e & 1);
+}
+__device__ __forceinline__ int output_col(int e, int lane, int warp) {
+  return (e / 8) * 64 + score_col(e % 8, lane, warp);
+}
+__device__ __forceinline__ uint16_t pack_e4m3_pair(float2 x) {
+  return __hg_cvt_float2_to_fp8x2(x, __HG_SATFINITE, __HG_E4M3);
+}
+
+__device__ __forceinline__ void mma(const uint32_t* a, const uint32_t* b,
+                                    float* c) {
+#if __HGGC_ARCH__ >= 150
+  asm volatile(
+      "ppu.tc02.mma.sync.aligned.m16n16k32.row.col.f32.e4m3.e4m3.f32 "
+      "{%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9,%10,%11}, "
+      "{%12,%13,%14,%15}, {%16,%17,%18,%19,%20,%21,%22,%23};"
+      : "=r"(c[0]), "=r"(c[1]), "=r"(c[2]), "=r"(c[3]), "=r"(c[4]), "=r"(c[5]),
+        "=r"(c[6]), "=r"(c[7])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]),
+        "r"(b[2]), "r"(b[3]), "r"(c[0]), "r"(c[1]), "r"(c[2]), "r"(c[3]),
+        "r"(c[4]), "r"(c[5]), "r"(c[6]), "r"(c[7]));
+#else
+  __builtin_trap();
+#endif
+}
+__device__ __forceinline__ void gemm(const uint32_t* a, const uint32_t* b,
+                                     Fragment<8>& c) {
+  mma(a, b, c.values);
+}
+template <int N>
+__device__ __forceinline__ void output_mma(const uint32_t* a, const uint32_t* b,
+                                           Fragment<N>& out, int n) {
+  mma(a, b, out.values + n * 8);
+}
+template <int N>
+__device__ __forceinline__ void output_mma(const uint32_t* a, const uint32_t* b,
+                                           HalfFragment<N>& out, int n) {
+  uint32_t* c = out.values + n * 4;
+#if __HGGC_ARCH__ >= 150
+  asm volatile(
+      "ppu.tc02.mma.sync.aligned.m16n16k32.row.col.f16.e4m3.e4m3.f16 "
+      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9,%10,%11}, {%12,%13,%14,%15};"
+      : "=r"(c[0]), "=r"(c[1]), "=r"(c[2]), "=r"(c[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]),
+        "r"(b[2]), "r"(b[3]), "r"(c[0]), "r"(c[1]), "r"(c[2]), "r"(c[3]));
+#else
+  __builtin_trap();
+#endif
+}
+__device__ __forceinline__ void copy_async_16(const void* src, void* dst,
+                                              bool valid) {
+  const auto address = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+  const int bytes = valid ? 16 : 0;
+  asm volatile(
+      "ppu.cp.async.cg.shared.global.LLC::128B [%0], [%1], 16, %2;" ::"r"(
+          address),
+      "l"(src), "r"(bytes));
+}
+__device__ __forceinline__ void commit_async() {
+  asm volatile("ppu.cp.async.commit_group;" ::);
+}
+__device__ __forceinline__ void wait_async() {
+  asm volatile("ppu.cp.async.wait_all;" ::);
+}
+extern "C" __device__ unsigned mat_trans_b8(unsigned) __asm(
+    "llvm.ppu.mat.trans.b8");
+constexpr float NEG_INF = -1e30f;
+constexpr float LOG2_P_SCALE = 4.f;
+constexpr float INV_P_SCALE = 1.f / 16.f;
+template <int Heads>
+__device__ __forceinline__ void reduce_score_max(const Fragment<8>& score,
+                                                 float* maxima, int lane,
+                                                 int warp, int row) {
+  float mx[2] = {NEG_INF, NEG_INF};
+  DSA_FP8_UNROLL
+  for (int e = 0; e < 8; ++e)
+    mx[score_row(e) / 8] = fmaxf(mx[score_row(e) / 8], score(e));
+  DSA_FP8_UNROLL
+  for (int delta = 1; delta <= 2; delta *= 2) {
+    mx[0] = fmaxf(mx[0], __shfl_xor_sync(0xffffffff, mx[0], delta));
+    mx[1] = fmaxf(mx[1], __shfl_xor_sync(0xffffffff, mx[1], delta));
+  }
+  if ((lane & 3) == 0) {
+    maxima[warp * Heads + row] = mx[0];
+    maxima[warp * Heads + row + 8] = mx[1];
+  }
+}
+template <class Store>
+__device__ __forceinline__ void quantize_probability(const Fragment<8>& score,
+                                                     float (&sums)[2],
+                                                     float max0, float max1,
+                                                     float scale_log2,
+                                                     Store store) {
+  DSA_FP8_UNROLL
+  for (int e = 0; e < 8; e += 2) {
+    const int row = score_row(e) / 8;
+    const float bias = LOG2_P_SCALE - (row ? max1 : max0);
+    const float x = exp2f(fmaf(score(e), scale_log2, bias));
+    const float y = exp2f(fmaf(score(e + 1), scale_log2, bias));
+    sums[row] += x + y;
+    store(e, pack_e4m3_pair(make_float2(x, y)));
+  }
+}
+template <class Gather>
+__device__ __forceinline__ void prime_kv_pipeline(Gather&& gather) {
+  gather(0);
+  commit_async();
+  wait_async();
+  __syncthreads();
+}
+template <class Gather>
+__device__ __forceinline__ void prefetch_next_kv(Gather&& gather, int tile,
+                                                 int tiles) {
+  if (tile + 1 < tiles) {
+    gather(tile + 1);
+    commit_async();
+  }
+}
+__device__ __forceinline__ void wait_next_kv(int tile, int tiles) {
+  if (tile + 1 < tiles) {
+    wait_async();
+    __syncthreads();
+  }
+}
+}  // namespace step5_dsa_fp8::detail
+
+// Four queries share region-major K/V staging. Each query uses two warps,
+// each with its own K32 softmax state and FP16 PV accumulator.
+namespace step5_dsa_fp8::reuse {
+using namespace detail;
+constexpr int D = 192, H = 16, K = 64, T = 128, Q = 4;
+constexpr int WarpsPerQuery = 2;
+constexpr int ConsumerThreads = Q * WarpsPerQuery * 32;
+constexpr int ScoreTiles = K / 16 / WarpsPerQuery;
+constexpr int DimTiles = D / 16, OutputTiles = DimTiles;
+constexpr int Stages = 2;
+constexpr float RowMaxSlack = 2.f;
+static_assert(LOG2_P_SCALE + RowMaxSlack <= 8.f,
+              "Lagging rowmax must reserve E4M3 probability headroom");
+using PackedWord = int;
+using PackedBits = uint32_t;
+__device__ __forceinline__ PackedBits uniform_packed(PackedWord word) {
+  return uint32_t(DSA_FP8_UNIF(uint32_t(word)));
+}
+__host__ __device__ constexpr int packed_count_shift(int query) {
+  return 13 + query * 4;
+}
+__device__ __forceinline__ int packed_visible(PackedBits word, int query) {
+  return int((word >> packed_count_shift(query)) & 15);
+}
+
+template <int Pending>
+__device__ __forceinline__ void wait_committed_copy_groups() {
+  asm volatile("ppu.cp.async.wait_group %0;" ::"n"(Pending));
+}
+
+constexpr int QBytes = H * D, KVBytes = K * D;
+constexpr int KStageBytes = KVBytes, VStageBytes = KVBytes;
+constexpr int OperandBytes = Stages * (KStageBytes + VStageBytes);
+constexpr int PartialBytes = Q * 32 * DimTiles * 8 * sizeof(__half);
+constexpr int ReclaimedBytes =
+    OperandBytes > PartialBytes ? OperandBytes : PartialBytes;
+constexpr int MetadataChunkWords = 4;
+constexpr int MetadataChunkBytes = MetadataChunkWords * sizeof(PackedWord);
+constexpr int MetadataChunks = 8 / MetadataChunkWords;
+constexpr int MetadataStages = 2;
+constexpr int MaskStorageWords = Stages * K;
+constexpr int SharedBytes = ReclaimedBytes +
+                            MaskStorageWords * sizeof(PackedWord) +
+                            2 * Q * WarpsPerQuery * H * sizeof(float);
+__device__ __forceinline__ int metadata_slot(int tile, int region) {
+  return 8 + (tile % MetadataStages) * 8 + region;
+}
+template <bool RegionMajor>
+__device__ __forceinline__ void load_key(uint32_t* fragment, int base, int n,
+                                         int step) {
+  const int address = DSA_FP8_UNIF(
+      base +
+      (RegionMajor ? n * (2 * 8 * D / 16) + (step / 2) * (8 * 64 / 16)
+                   : n * 64 + (step / 2) * K * 4) +
+      (step % 2) * 2);
+  DSA_FP8_LDM(fragment, address, RegionMajor ? 8 * D / 16 : 32, 1);
+}
+__host__ __device__ constexpr int packed_capacity(int width) {
+  return Q * width;
+}
+// One swizzled descriptor covers all 192 channels and Rows contiguous tokens.
+template <int Rows = 8>
+__device__ __forceinline__ void aiu_region(E4M3* destination,
+                                           const E4M3* source, int rows,
+                                           int start, int64_t stride) {
+  const unsigned address = unsigned(__cvta_generic_to_shared(destination));
+  asm volatile(
+      "ppu.cp.async.aiu.bulk.tensor.shared.global.2d.tile.cs.padz.swzl.b8 "
+      "[%0], [%1], {%2,%3,%4}, {%5,%6,%7}, {%8,%9}, {%10,%11,%12}, %13;" ::"r"(
+          address),
+      "l"(source), "r"(64), "r"(rows), "r"(3), "r"(64), "r"(Rows), "r"(3),
+      "l"(stride), "l"(int64_t(64)), "r"(0), "r"(start), "r"(0), "r"(1)
+      : "memory");
+}
+
+// Matching P/V permutations from FlashMLA-for-sail's PairedVLoad. A b16
+// transpose moves FP8 byte pairs; keep that ordering through the PV MMA.
+// The paired-load helper is adapted under the following MIT notice:
+// Copyright (c) 2022-2026 T-Head (Shanghai) Semiconductor Co., Ltd.
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+__device__ __forceinline__ int paired_column(int col) {
+  return (col & ~14) | ((col & 6) << 1) | ((col & 8) >> 2);
+}
+
+template <bool RegionMajor>
+__device__ __forceinline__ void paired_v_load(uint32_t* first, uint32_t* second,
+                                              const E4M3* base, int col,
+                                              int step) {
+  const int address = DSA_FP8_UNIF(int(reinterpret_cast<uintptr_t>(base) / 16) +
+                                   (col / 64) * (RegionMajor ? 8 * 4 : K * 4) +
+                                   (col % 64) / 16 +
+                                   step * (RegionMajor ? 4 * 8 * D / 16 : 128));
+  uint32_t lo[4], hi[4];
+  auto load_lo = [&]() {
+    asm volatile(
+        "ppu.tc02.ldmatrix.swzl.sync.bulk.tensor.m8n8.x4.b16.trans "
+        "{%0,%1,%2,%3}, [%4], %5,%6,%7;"
+        : "=r"(lo[0]), "=r"(lo[1]), "=r"(lo[2]), "=r"(lo[3])
+        : "l"(address), "r"(1), "r"(RegionMajor ? 8 * D / 16 : 32), "n"(1));
+  };
+  auto load_hi = [&]() {
+    asm volatile(
+        "ppu.tc02.ldmatrix.swzl.sync.bulk.tensor.m8n8.x4.b16.trans "
+        "{%0,%1,%2,%3}, [%4], %5,%6,%7;"
+        : "=r"(hi[0]), "=r"(hi[1]), "=r"(hi[2]), "=r"(hi[3])
+        : "l"(address + (RegionMajor ? 2 * 8 * D / 16 : 64)), "r"(1),
+          "r"(RegionMajor ? 8 * D / 16 : 32), "n"(1));
+  };
+  load_lo();
+  load_hi();
+  first[0] = __byte_perm(lo[0], lo[1], 0x6420u);
+  first[1] = __byte_perm(hi[0], hi[1], 0x6420u);
+  first[2] = __byte_perm(lo[0], lo[1], 0x7531u);
+  first[3] = __byte_perm(hi[0], hi[1], 0x7531u);
+  second[0] = __byte_perm(lo[2], lo[3], 0x6420u);
+  second[1] = __byte_perm(hi[2], hi[3], 0x6420u);
+  second[2] = __byte_perm(lo[2], lo[3], 0x7531u);
+  second[3] = __byte_perm(hi[2], hi[3], 0x7531u);
+}
+
+// Each entry packs a region and inclusive causal visible-token counts.
+// Duplicate valid slots retain list semantics by using the original consumer.
+template <int BitmapCapacity = 256>
+__device__ __forceinline__ void prepare(const int* regions,
+                                        const int64_t* positions, int* info,
+                                        PackedWord* packed, int q_len,
+                                        int kv_len, int heads, int width,
+                                        int64_t rq, int64_t rh,
+                                        int logical_group) {
+  static_assert(BitmapCapacity > 0 && BitmapCapacity <= 256);
+  constexpr int PrepareWarps = T / 32;
+  constexpr int BitmapWords = (BitmapCapacity + T - 1) / T;
+  constexpr int QueryThreads = T / Q;
+  __shared__ unsigned bitmap[Q][256];
+  __shared__ int sums[PrepareWarps][2];
+  __shared__ int counts[PrepareWarps][Q];
+  __shared__ int slot_counts[PrepareWarps][Q];
+  __shared__ int duplicate;
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid / 32;
+  const int group = logical_group;
+  const int base = (group / heads) * Q;
+  const int head = group % heads;
+  int horizons[Q];
+  int slots[Q] = {};
+  bool dense_candidate = true;
+  DSA_FP8_UNROLL
+  for (int q = 0; q < Q; ++q) {
+    const int64_t pos = base + q < q_len ? positions[base + q] : -1;
+    horizons[q] = pos < 0 ? -1 : int(min(pos, int64_t(kv_len) - 1));
+    dense_candidate &= horizons[q] < 0 || horizons[q] / 8 + 1 <= width;
+  }
+  if (dense_candidate) {
+    // Step's ordered complete-history form stores prior regions at the
+    // beginning and the current region in the final slot. Verify EVERY
+    // entry, including padding, before using this shortcut.
+    bool mismatch = false;
+    DSA_FP8_UNROLL
+    for (int q = 0; q < Q; ++q) {
+      const int limit = horizons[q] >= 0 ? horizons[q] / 8 : -1;
+      if (base + q < q_len) {
+        for (int i = tid; i < width; i += T) {
+          const int region = regions[int64_t(base + q) * rq + head * rh + i];
+          if (i < limit)
+            mismatch |= region != i;
+          else if (limit >= 0 && i == width - 1)
+            mismatch |= region != limit;
+          else
+            mismatch |= region >= 0 && region <= limit;
+        }
+      }
+    }
+    const int failed = __any_sync(0xffffffffu, mismatch);
+    if (!lane) sums[warp][0] = failed;
+    __syncthreads();
+    int any_failed = 0;
+    DSA_FP8_UNROLL
+    for (int w = 0; w < PrepareWarps; ++w) any_failed |= sums[w][0];
+    if (!any_failed) {
+      int complete[Q], live = 0, pair_total = 0, visible_lists = 0;
+      DSA_FP8_UNROLL
+      for (int q = 0; q < Q; ++q) {
+        complete[q] = horizons[q] < 0 ? 0 : horizons[q] / 8 + 1;
+        live = max(live, complete[q]);
+        visible_lists |= int(complete[q] == width) << q;
+      }
+      DSA_FP8_UNROLL
+      for (int pair = 0; pair < Q / 2; ++pair)
+        pair_total += max(complete[pair * 2], complete[pair * 2 + 1]);
+      const bool selected = live < pair_total;
+      if (!tid) {
+        info[group * 3] = selected ? 3 : 0;
+        info[1 + group * 3] = live;
+        info[2 + group * 3] = visible_lists;
+      }
+      return;
+    }
+  }
+  if (!tid) duplicate = 0;
+  // Retain the physical 1KiB query stride, preserving the four TSM groups.
+  // Only the words addressable by the current KV extent need initialization.
+  for (int i = tid; i < Q * BitmapCapacity; i += T)
+    bitmap[i / BitmapCapacity][i % BitmapCapacity] = 0;
+  __syncthreads();
+  // Four warps process the four query lists concurrently. Slot counts keep
+  // their original per-query reduction layout below.
+  const int own_query = tid / QueryThreads;
+  const int query_lane = tid % QueryThreads;
+  int own_horizon = -1;
+  DSA_FP8_UNROLL
+  for (int q = 0; q < Q; ++q)
+    if (own_query == q) own_horizon = horizons[q];
+  const int own_limit = own_horizon < 0 ? -1 : own_horizon / 8;
+  int own_slots = 0;
+  if (base + own_query < q_len && own_limit >= 0) {
+    const int* row = regions + int64_t(base + own_query) * rq + head * rh;
+    auto insert_region = [&](int region) {
+      if (region >= 0 && region <= own_limit) {
+        ++own_slots;
+        const unsigned bit = 1u << (region & 31);
+        if (atomicOr(&bitmap[own_query][region >> 5], bit) & bit)
+          atomicExch(&duplicate, 1);
+      }
+    };
+    // Query/head strides and a tensor's storage offset need only preserve
+    // int32 alignment. Peel up to3 entries before a legal uint4 load.
+    const int prefix = min(width, int((16 - (uintptr_t(row) & 15)) & 15) / 4);
+    const int vectors = (width - prefix) / 4;
+    const int tail = prefix + vectors * 4;
+    if (query_lane < prefix) {
+      const int region = row[query_lane];
+      insert_region(region);
+    }
+    for (int i = query_lane; i < vectors; i += QueryThreads) {
+      const auto* source = reinterpret_cast<const uint4*>(row + prefix + i * 4);
+      const uint4 data = *source;
+      insert_region(int(data.x));
+      insert_region(int(data.y));
+      insert_region(int(data.z));
+      insert_region(int(data.w));
+    }
+    if (tail + query_lane < width) {
+      const int region = row[tail + query_lane];
+      insert_region(region);
+    }
+  }
+  DSA_FP8_UNROLL
+  for (int q = 0; q < Q; ++q) slots[q] = own_query == q ? own_slots : 0;
+  __syncthreads();
+  unsigned bits[BitmapWords], members[Q][BitmapWords];
+  int query_counts[Q] = {};
+  int count = 0, pairs = 0;
+  DSA_FP8_UNROLL
+  for (int j = 0; j < BitmapWords; ++j) {
+    bits[j] = 0;
+    DSA_FP8_UNROLL
+    for (int q = 0; q < Q; ++q) {
+      const int word = tid * BitmapWords + j;
+      members[q][j] = word < BitmapCapacity ? bitmap[q][word] : 0;
+      bits[j] |= members[q][j];
+      query_counts[q] += __popc(members[q][j]);
+    }
+    count += __popc(bits[j]);
+    DSA_FP8_UNROLL
+    for (int pair = 0; pair < Q / 2; ++pair)
+      pairs += __popc(members[pair * 2][j] | members[pair * 2 + 1][j]);
+  }
+  int inclusive = count;
+  DSA_FP8_UNROLL
+  for (int delta = 1; delta < 32; delta *= 2) {
+    const int prev = __shfl_up_sync(0xffffffffu, inclusive, delta);
+    if (lane >= delta) inclusive += prev;
+  }
+  DSA_FP8_UNROLL
+  for (int delta = 16; delta; delta /= 2)
+    pairs += __shfl_down_sync(0xffffffffu, pairs, delta);
+  if (lane == 31) sums[warp][0] = inclusive;
+  if (!lane) sums[warp][1] = pairs;
+  DSA_FP8_UNROLL
+  for (int q = 0; q < Q; ++q) {
+    DSA_FP8_UNROLL
+    for (int delta = 16; delta; delta /= 2) {
+      query_counts[q] += __shfl_down_sync(0xffffffffu, query_counts[q], delta);
+      slots[q] += __shfl_down_sync(0xffffffffu, slots[q], delta);
+    }
+    if (!lane) {
+      counts[warp][q] = query_counts[q];
+      slot_counts[warp][q] = slots[q];
+    }
+  }
+  __syncthreads();
+  int live = 0, pair_total = 0, rank = inclusive - count;
+  DSA_FP8_UNROLL
+  for (int w = 0; w < PrepareWarps; ++w) {
+    if (w < warp) rank += sums[w][0];
+    live += sums[w][0];
+    pair_total += sums[w][1];
+  }
+  int max_live = 0, visible_lists = 0;
+  bool complete_history = true;
+  DSA_FP8_UNROLL
+  for (int q = 0; q < Q; ++q) {
+    int valid = 0, unique_sum = 0;
+    DSA_FP8_UNROLL
+    for (int w = 0; w < PrepareWarps; ++w) {
+      unique_sum += counts[w][q];
+      valid += slot_counts[w][q];
+    }
+    max_live = max(max_live, unique_sum);
+    visible_lists |= int(valid == width) << q;
+    complete_history &=
+        unique_sum == (horizons[q] >= 0 ? horizons[q] / 8 + 1 : 0);
+  }
+  // Reuse when Q4 reduces K/V traffic compared with two Q2 unions.
+  // Bound union expansion to four times the largest individual list.
+  const bool selected = !duplicate && live < pair_total && live <= max_live * Q;
+  if (!tid) {
+    info[group * 3] = selected ? (complete_history ? 3 : 1) : 0;
+    info[1 + group * 3] = live;
+    info[2 + group * 3] = visible_lists;
+  }
+  if (!selected || complete_history) return;
+  packed += int64_t(group) * packed_capacity(width);
+  // The final eight-region ring tile must contain explicit zero words after
+  // live. Whole chunks beyond this allocation are zero-filled by cp.async.
+  // These writes are disjoint from every live bitmap rank below.
+  const int padded_end = min(packed_capacity(width), (live + 7) & ~7);
+  if (tid < padded_end - live) packed[live + tid] = 0;
+  const int last = horizons[0] >> 3;
+  bool common_end = true;
+  PackedBits tails = 0;
+  DSA_FP8_UNROLL
+  for (int q = 0; q < Q; ++q) {
+    common_end &= (horizons[q] >> 3) == last;
+    tails |= PackedBits((horizons[q] & 7) + 1) << packed_count_shift(q);
+  }
+  if (DSA_FP8_UNIF(common_end)) {
+    DSA_FP8_UNROLL
+    for (int j = 0; j < BitmapWords; ++j) {
+      while (bits[j]) {
+        const int bit = __ffs(bits[j]) - 1;
+        const int r = (tid * BitmapWords + j) * 32 + bit;
+        PackedBits presence = 0;
+        DSA_FP8_UNROLL
+        for (int q = 0; q < Q; ++q)
+          presence |= PackedBits((members[q][j] >> bit) & 1u)
+                      << packed_count_shift(q);
+        // Membership proves causality. Every nonterminal region is full;
+        // the common terminal region selects each query's exact tail count.
+        const PackedBits counts =
+            r == last ? (presence * 15u) & tails : presence << 3;
+        packed[rank++] = PackedWord(PackedBits(r) | counts);
+        bits[j] &= bits[j] - 1;
+      }
+    }
+    return;
+  }
+  DSA_FP8_UNROLL
+  for (int j = 0; j < BitmapWords; ++j) {
+    while (bits[j]) {
+      const int bit = __ffs(bits[j]) - 1;
+      const int r = (tid * BitmapWords + j) * 32 + bit;
+      PackedBits word = r;
+      DSA_FP8_UNROLL
+      for (int q = 0; q < Q; ++q) {
+        const unsigned n = members[q][j] & (1u << bit)
+                               ? min(8, max(0, horizons[q] - r * 8 + 1))
+                               : 0;
+        word |= PackedBits(n) << packed_count_shift(q);
+      }
+      packed[rank++] = PackedWord(word);
+      bits[j] &= bits[j] - 1;
+    }
+  }
+}
+
+template <int BitmapCapacity = 256>
+__global__ void prepare_standalone(const int* regions, const int64_t* positions,
+                                   int* info, PackedWord* packed, int q_len,
+                                   int kv_len, int heads, int width, int64_t rq,
+                                   int64_t rh) {
+  prepare<BitmapCapacity>(regions, positions, info, packed, q_len, kv_len,
+                          heads, width, rq, rh, blockIdx.x);
+}
+
+// Eligibility belongs to each query group. The FP32 consumer retains list
+// multiplicity for groups that cannot safely share K/V.
+template <bool BF16, bool Dense>
+__device__ __forceinline__ void prefill(
+    const void* query, const E4M3* key, const E4M3* value, const int* info,
+    const PackedWord* packed, const int64_t* positions, __ppu_bfloat16* out,
+    int q_len, int kv_len, int heads, int groups, int width, int64_t qt,
+    int64_t qh, int64_t kt, int64_t kh, int64_t vt, int64_t vh, float inv_q,
+    float scale_log2, float v_scale, int logical_group) {
+  constexpr bool RegionLayout = !Dense;
+  // Descending causal horizons put long dense tasks first. This changes
+  // block assignment only; every group keeps its own masks and output.
+  const int group = logical_group;
+  const int base = (group / heads) * Q, head = group % heads;
+  const int live = DSA_FP8_UNIF(info[1 + group * 3]);
+  int horizons[Q];
+  if constexpr (Dense) {
+    DSA_FP8_UNROLL
+    for (int q = 0; q < Q; ++q) {
+      const int64_t pos = base + q < q_len ? positions[base + q] : -1;
+      horizons[q] =
+          DSA_FP8_UNIF(pos < 0 ? -1 : int(min(pos, int64_t(kv_len) - 1)));
+    }
+  }
+  packed += int64_t(group) * packed_capacity(width);
+  extern __shared__ __align__(128) char storage[];
+  E4M3 *sk = reinterpret_cast<E4M3*>(storage), *sv = sk + Stages * KStageBytes;
+  E4M3* sq = sk;
+  PackedWord* mask = reinterpret_cast<PackedWord*>(storage + ReclaimedBytes);
+  const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32, mi = lane / 4;
+  const int query_warp = DSA_FP8_UNIF(warp / WarpsPerQuery);
+  const int output_warp = DSA_FP8_UNIF(warp % WarpsPerQuery);
+  float* cross_max = reinterpret_cast<float*>(mask + MaskStorageWords);
+  float* cross_sum = cross_max + Q * WarpsPerQuery * H;
+  for (int i = tid; i < Q * H * (D / 16); i += ConsumerThreads) {
+    const int q = i / (H * (D / 16));
+    const int row = (i / (D / 16)) % H, col = i % (D / 16) * 16;
+    Vec16 high{};
+    if (base + q < q_len && row < groups) {
+      const int64_t offset =
+          int64_t(base + q) * qt + (head * groups + row) * qh + col;
+      if constexpr (BF16) {
+        const auto* src = static_cast<const __ppu_bfloat16_raw*>(query) + offset;
+        DSA_FP8_UNROLL
+        for (int j = 0; j < 8; ++j) {
+          auto raw = *reinterpret_cast<const __ppu_bfloat162_raw*>(src + 2 * j);
+          float2 x = __bfloat1622float2(__ppu_bfloat162(raw));
+          x.x *= inv_q;
+          x.y *= inv_q;
+          reinterpret_cast<uint16_t*>(&high)[j] = pack_e4m3_pair(x);
+        }
+      } else {
+        high = *reinterpret_cast<const Vec16*>(static_cast<const E4M3*>(query) +
+                                               offset);
+      }
+    }
+    *reinterpret_cast<Vec16*>(sq + q * QBytes + swizzle<H>(row, col)) = high;
+  }
+  __syncthreads();
+  const int qa = DSA_FP8_UNIF(int(reinterpret_cast<uintptr_t>(sq) / 16) +
+                              query_warp * (QBytes / 16));
+  const int ka = DSA_FP8_UNIF(int(reinterpret_cast<uintptr_t>(sk) / 16));
+  const E4M3* query_value = sv;
+  uint32_t rq[D / 32][4];
+  DSA_FP8_UNROLL
+  for (int step = 0; step < D / 32; ++step) {
+    const int offset = (step / 2) * H * 4 + (step % 2) * 2;
+    DSA_FP8_LDM(rq[step], qa + offset, 1, 32);
+  }
+  __syncthreads();
+  HalfFragment<OutputTiles * 8> output;
+  clear(output);
+  float maximum0 = NEG_INF, maximum1 = NEG_INF, denominator0 = 0.f,
+        denominator1 = 0.f;
+  const int tiles = DSA_FP8_UNIF((live * 8 + K - 1) / K);
+  auto visible_pair = [&](int tile, int n) {
+    const int first = (tile % Stages) * K + n * 2;
+    const PackedBits a = uniform_packed(mask[first]);
+    const PackedBits b = uniform_packed(mask[first + 1]);
+    return packed_visible(a, query_warp) | (packed_visible(b, query_warp) << 4);
+  };
+  // Compact masks use words [0,8) and [64,72). The two metadata buffers
+  // occupy unused padding without growing shared storage.
+  auto prefetch_metadata = [&](int tile) {
+    if constexpr (!Dense) {
+      if (tid < MetadataChunks) {
+        const int chunk = tid;
+        const int slot = tile * (K / 8) + chunk * MetadataChunkWords;
+        const bool valid = slot < packed_capacity(width);
+        const void* source = packed + (valid ? slot : 0);
+        auto* destination =
+            mask + metadata_slot(tile, chunk * MetadataChunkWords);
+        const unsigned address =
+            unsigned(__cvta_generic_to_shared(destination));
+        const int bytes = valid ? MetadataChunkBytes : 0;
+        asm volatile(
+            "ppu.cp.async.ca.shared.global.LLC::128B [%0], [%1], %2, %3;" ::"r"(
+                address),
+            "l"(source), "n"(MetadataChunkBytes), "r"(bytes)
+            : "memory");
+      }
+    }
+  };
+  auto gather = [&](int tile) {
+    const int stage = tile % Stages;
+    // One warp owns one eight-token region. Use the same index word for
+    // compact visibility and both AIU descriptors instead of loading it once
+    // in the row loop and again in the region loop.
+    const int region = DSA_FP8_UNIF(warp);
+    const int slot = DSA_FP8_UNIF(tile * (K / 8) + region);
+    unsigned word = 0;
+    if constexpr (Dense) {
+      DSA_FP8_UNROLL
+      for (int q = 0; q < Q; ++q)
+        word |= unsigned(min(8, max(0, horizons[q] - slot * 8 + 1)))
+                << (13 + q * 4);
+    } else {
+      word = unsigned(DSA_FP8_UNIF(mask[metadata_slot(tile, region)]));
+    }
+
+    const int token = DSA_FP8_UNIF(
+        Dense ? slot * 8 : (!word ? kv_len : int(word & 8191) * 8));
+    // With explicit zero metadata, redirect padding past the source extent.
+    // AIU padz still writes eight zero rows, while its bounds stay invariant.
+    if constexpr (Dense) {
+      // All K64 rows are contiguous. One full192-channel slab descriptor
+      // per operand replaces eight region descriptors.
+      if (region == 0)
+        aiu_region<K>(sk + stage * KStageBytes, key + head * kh, kv_len,
+                      tile * K, kt);
+      if (region == 1)
+        aiu_region<K>(sv + stage * VStageBytes, value + head * vh, kv_len,
+                      tile * K, vt);
+    } else {
+      aiu_region(sk + stage * KStageBytes + region * (8 * D), key + head * kh,
+                 kv_len, token, kt);
+      aiu_region(sv + stage * VStageBytes + region * (8 * D), value + head * vh,
+                 kv_len, token, vt);
+    }
+    if (!lane) mask[stage * K + region] = int(word);
+  };
+  if constexpr (!Dense) {
+    if (tiles > 0) {
+      prefetch_metadata(0);
+      if (tiles > 1) prefetch_metadata(1);
+      commit_async();
+      wait_committed_copy_groups<0>();
+      __syncthreads();
+    }
+  }
+  if (tiles > 0) {
+    gather(0);
+    commit_async();
+    wait_committed_copy_groups<0>();
+    __syncthreads();
+  }
+  auto process_tile = [&](int tile) __attribute__((always_inline)) {
+    if constexpr (Dense) {
+      prefetch_next_kv(gather, tile, tiles);
+    } else if (tile + 1 < tiles) {
+      // Consume the already-published ring slot before issuing the next
+      // independent metadata copy. It shares the original K/V commit.
+      gather(tile + 1);
+      if (tile + MetadataStages < tiles)
+        prefetch_metadata(tile + MetadataStages);
+      commit_async();
+    }
+    bool query_live = true;
+    int query_visibility = 0;
+    if constexpr (!Dense) {
+      // Each warp owns an independent K32 max/denominator/output state.
+      // Issue all producers first, then skip only math for an empty part.
+      const int lo = visible_pair(tile, output_warp * 2);
+      const int hi = visible_pair(tile, output_warp * 2 + 1);
+      query_visibility = lo | (hi << 8);
+      query_live = DSA_FP8_UNIF(query_visibility) != 0;
+    }
+    if (query_live) {
+      Fragment<8> score[ScoreTiles];
+      float mx0 = NEG_INF, mx1 = NEG_INF;
+      // Interleave independent N accumulators across the six K32 updates.
+      DSA_FP8_UNROLL
+      for (int ni = 0; ni < ScoreTiles; ++ni) {
+        clear(score[ni]);
+      }
+      DSA_FP8_UNROLL
+      for (int step = 0; step < D / 32; ++step) {
+        uint32_t rk[4];
+        DSA_FP8_UNROLL
+        for (int ni = 0; ni < ScoreTiles; ++ni) {
+          const int n = DSA_FP8_UNIF(ni + output_warp * ScoreTiles);
+          load_key<RegionLayout>(rk, ka + (tile % Stages) * (KStageBytes / 16),
+                                 n, step);
+          gemm(rq[step], rk, score[ni]);
+        }
+      }
+      DSA_FP8_UNROLL
+      for (int ni = 0; ni < ScoreTiles; ++ni) {
+        const int n = DSA_FP8_UNIF(ni + output_warp * ScoreTiles);
+        const int visible = Dense ? visible_pair(tile, n)
+                                  : ((query_visibility >> (ni * 8)) & 255);
+        DSA_FP8_UNROLL
+        for (int e = 0; e < 8; ++e) {
+          const int col = score_col(e, lane, n);
+          const float x = score[ni](e);
+          const bool valid = (col & 7) < ((visible >> ((e & 4) ? 4 : 0)) & 15);
+          score[ni](e) = valid ? x : -INFINITY;
+          if (score_row(e))
+            mx1 = fmaxf(mx1, score[ni](e));
+          else
+            mx0 = fmaxf(mx0, score[ni](e));
+        }
+      }
+      const bool inside = maximum0 != NEG_INF && maximum1 != NEG_INF &&
+                          scale_log2 > 0.f &&
+                          mx0 * scale_log2 <= maximum0 + RowMaxSlack &&
+                          mx1 * scale_log2 <= maximum1 + RowMaxSlack;
+      const bool skip_max = DSA_FP8_UNIF(__all_sync(0xffffffffu, inside));
+      float next0 = maximum0, next1 = maximum1, alpha0 = 1.f, alpha1 = 1.f;
+      if (!skip_max) {
+        DSA_FP8_UNROLL
+        for (int delta = 1; delta <= 2; delta *= 2) {
+          mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, delta));
+          mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, delta));
+        }
+
+        const float candidate0 = ceilf(mx0 * scale_log2);
+        const float candidate1 = ceilf(mx1 * scale_log2);
+        next0 = candidate0 - maximum0 > RowMaxSlack ? candidate0 : maximum0;
+        next1 = candidate1 - maximum1 > RowMaxSlack ? candidate1 : maximum1;
+        alpha0 = maximum0 == NEG_INF || next0 == maximum0
+                     ? 1.f
+                     : exp2f(maximum0 - next0);
+        alpha1 = maximum1 == NEG_INF || next1 == maximum1
+                     ? 1.f
+                     : exp2f(maximum1 - next1);
+      }
+      maximum0 = next0;
+      maximum1 = next1;
+      float sums[2] = {0.f, 0.f};
+      uint32_t register_p[ScoreTiles * 2] = {};
+      DSA_FP8_UNROLL
+      for (int ni = 0; ni < ScoreTiles; ++ni) {
+        auto store = [&](int e, uint16_t word) {
+          // Hardware coordinate probe proves this is exactly the paired-P
+          // LDM operand: C elements 0,1,4,5 then2,3,6,7, separately for
+          // N0/N1.
+          register_p[ni * 2 + ((e >> 1) & 1)] |= uint32_t(word)
+                                                 << ((e >> 2) * 16);
+        };
+        quantize_probability(score[ni], sums, next0, next1, scale_log2, store);
+      }
+
+      denominator0 = denominator0 * alpha0 + sums[0];
+      denominator1 = denominator1 * alpha1 + sums[1];
+      bool needs_rescale = alpha0 != 1.f || alpha1 != 1.f;
+      needs_rescale = DSA_FP8_UNIF(__any_sync(0xffffffffu, needs_rescale));
+      if (needs_rescale) output_scale(output, alpha0, alpha1);
+      __syncwarp();
+      DSA_FP8_UNROLL
+      for (int si = 0; si < K / 32 / WarpsPerQuery; ++si) {
+        const int step =
+            DSA_FP8_UNIF(output_warp * (K / 32 / WarpsPerQuery) + si);
+        uint32_t rp[4];
+        DSA_FP8_UNROLL
+        for (int i = 0; i < 4; ++i) rp[i] = register_p[si * 4 + i];
+        DSA_FP8_UNROLL
+        for (int n = 0; n < DimTiles; n += 2) {
+          uint32_t first[4], second[4];
+          paired_v_load<RegionLayout>(
+              first, second, query_value + (tile % Stages) * VStageBytes,
+              n * 16, step);
+          output_mma(rp, first, output, n);
+          output_mma(rp, second, output, n + 1);
+        }
+      }
+    }
+    if (tile + 1 < tiles) {
+      // Publish the next stage and release every reader of the old stage.
+      wait_committed_copy_groups<0>();
+      __syncthreads();
+    }
+  };
+  // Keep every original per-tile wait/barrier and exact arithmetic order.
+  // Two explicit calls expose constant alternating-stage parity to HGGC.
+  // Keep two call sites so odd tails do not create a third body clone.
+  for (int pair = 0; pair < (tiles + 1) / 2; ++pair) {
+    process_tile(pair * 2);
+    if (pair * 2 + 1 < tiles) process_tile(pair * 2 + 1);
+  }
+  DSA_FP8_UNROLL
+  for (int delta = 1; delta <= 2; delta *= 2) {
+    denominator0 += __shfl_xor_sync(0xffffffffu, denominator0, delta);
+    denominator1 += __shfl_xor_sync(0xffffffffu, denominator1, delta);
+  }
+
+  // Unnormalized half accumulators can overflow. Mark only that Q group
+  // for the FP32 consumer, launched after the reuse kernel.
+  bool bad = false;
+  DSA_FP8_UNROLL
+  for (int i = 0; i < OutputTiles * 4; ++i) {
+    const uint32_t word = output.values[i];
+    bad |= (word & 0x7c00u) == 0x7c00u || (word & 0x7c000000u) == 0x7c000000u;
+  }
+  if (__any_sync(0xffffffffu, bad) && !lane)
+    atomicExch(const_cast<int*>(info + group * 3), 0);
+  // K/V have no remaining readers after this boundary. Reclaim them for
+  // the one final reduction of the two K32 partial outputs per query.
+  __syncthreads();
+  float* partial_output = reinterpret_cast<float*>(sk);
+  if (!(lane & 3)) {
+    cross_sum[warp * H + mi] = denominator0;
+    cross_sum[warp * H + mi + 8] = denominator1;
+    cross_max[warp * H + mi] = maximum0;
+    cross_max[warp * H + mi + 8] = maximum1;
+  }
+  if (!output_warp) {
+    auto* words = reinterpret_cast<uint32_t*>(partial_output);
+    DSA_FP8_UNROLL
+    for (int i = 0; i < DimTiles * 4; ++i)
+      words[(query_warp * DimTiles * 4 + i) * 32 + lane] = output.values[i];
+  }
+  __syncthreads();
+  if (!output_warp) return;
+  const int base_row = query_warp * WarpsPerQuery * H + mi;
+  const float common0 = fmaxf(cross_max[base_row], maximum0);
+  const float common1 = fmaxf(cross_max[base_row + 8], maximum1);
+  const float weight00 = exp2f(cross_max[base_row] - common0);
+  const float weight01 = exp2f(cross_max[base_row + 8] - common1);
+  const float weight10 = exp2f(maximum0 - common0);
+  const float weight11 = exp2f(maximum1 - common1);
+  // Merge in FP32 and store directly. Rounding the combined value back
+  // to FP16 would add error and could overflow despite finite partials.
+  denominator0 = cross_sum[base_row] * weight00 + denominator0 * weight10;
+  denominator1 = cross_sum[base_row + 8] * weight01 + denominator1 * weight11;
+  const auto* words = reinterpret_cast<const uint32_t*>(partial_output);
+  DSA_FP8_UNROLL
+  for (int n = 0; n < DimTiles; ++n) {
+    Fragment<8> merged;
+    DSA_FP8_UNROLL
+    for (int e = 0; e < 8; ++e) {
+      const uint32_t word =
+          words[(query_warp * DimTiles * 4 + n * 4 + e / 2) * 32 + lane];
+      const float remote =
+          __half2float(reinterpret_cast<const __half*>(&word)[e & 1]);
+      merged(e) =
+          output_get(output, n * 8 + e) * (score_row(e) ? weight11 : weight10) +
+          remote * (score_row(e) ? weight01 : weight00);
+    }
+    const float a = merged(1), b = merged(3);
+    merged(1) = merged(4);
+    merged(4) = a;
+    merged(3) = merged(6);
+    merged(6) = b;
+    DSA_FP8_UNROLL
+    for (int e = 0; e < 8; e += 2) {
+      const int row = mi + score_row(e);
+      const int logical_col = n * 16 + score_col(e, lane, 0);
+      const int col = paired_column(logical_col);
+      if (base + query_warp < q_len && row < groups) {
+        const float denom = score_row(e) ? denominator1 : denominator0;
+        const float factor = denom > 0.f ? v_scale / denom : 0.f;
+        const auto a = __float2bfloat16_rn(merged(e) * factor);
+        const auto b = __float2bfloat16_rn(merged(e + 1) * factor);
+        auto* dst =
+            out +
+            ((int64_t(base + query_warp) * heads + head) * groups + row) * D +
+            col;
+        *reinterpret_cast<uint32_t*>(dst) =
+            uint32_t(reinterpret_cast<const uint16_t&>(a)) |
+            (uint32_t(reinterpret_cast<const uint16_t&>(b)) << 16);
+      }
+    }
+  }
+  return;
+}
+
+template <bool BF16>
+__global__ __launch_bounds__(ConsumerThreads, 4) void prefill_mixed(
+    const void* query, const E4M3* key, const E4M3* value, const int* info,
+    const PackedWord* packed, const int64_t* positions, __ppu_bfloat16* out,
+    int q_len, int kv_len, int heads, int groups, int width, int64_t qt,
+    int64_t qh, int64_t kt, int64_t kh, int64_t vt, int64_t vh, float inv_q,
+    float scale_log2, float v_scale, const int* nan_flag) {
+  const int task = int(blockIdx.x);
+  const int task_count = int(gridDim.x);
+  // Process descending causal horizons so long dense tasks start first.
+  const int group = task_count - 1 - task;
+  if (DSA_FP8_UNIF(*nan_flag)) return;
+  const int mode = DSA_FP8_UNIF(info[group * 3]);
+  if (!(mode & 1)) return;
+  if (DSA_FP8_UNIF(mode & 2))
+    prefill<BF16, true>(query, key, value, info, packed, positions, out, q_len,
+                        kv_len, heads, groups, width, qt, qh, kt, kh, vt, vh,
+                        inv_q, scale_log2, v_scale, group);
+  else
+    prefill<BF16, false>(query, key, value, info, packed, positions, out, q_len,
+                         kv_len, heads, groups, width, qt, qh, kt, kh, vt, vh,
+                         inv_q, scale_log2, v_scale, group);
+}
+}  // namespace step5_dsa_fp8::reuse
+
+namespace step5_dsa_fp8 {
+using namespace detail;
+constexpr int Dim = 192, Heads = 16, Keys = 64, Threads = 128;
+constexpr int GatherLanes = 4;
+// Saturating RNE conversion. Scales describe dequantization: real = FP8 *
+// scale.
+__device__ __forceinline__ void quantize_kv_fragment(
+    const __ppu_bfloat16_raw* k, const __ppu_bfloat16_raw* v, E4M3* ko, E4M3* vo,
+    int rows, int heads, int64_t kt, int64_t kh, int64_t vt, int64_t vh,
+    float inv_k, float inv_v, int* nan_flag, int64_t vector) {
+  // One thread converts 16 channels. This avoids tens of thousands of tiny
+  // pair-conversion CTAs when the complete contiguous KV prefix is converted.
+  if (vector >= int64_t(rows) * heads * (Dim / 16)) return;
+  const int d = vector % (Dim / 16) * 16;
+  const int h = (vector / (Dim / 16)) % heads;
+  const int t = vector / (Dim / 16) / heads;
+  auto* ki = k + int64_t(t) * kt + h * kh + d;
+  auto* vi = v + int64_t(t) * vt + h * vh + d;
+  const auto k0 = *reinterpret_cast<const Vec16*>(ki);
+  const auto k1 = *reinterpret_cast<const Vec16*>(ki + 8);
+  const auto v0 = *reinterpret_cast<const Vec16*>(vi);
+  const auto v1 = *reinterpret_cast<const Vec16*>(vi + 8);
+  Vec16 pk, pv;
+  bool has_nan = false;
+  DSA_FP8_UNROLL
+  for (int j = 0; j < 8; ++j) {
+    const auto a =
+        reinterpret_cast<const __ppu_bfloat162_raw*>(j < 4 ? &k0 : &k1)[j % 4];
+    const auto b =
+        reinterpret_cast<const __ppu_bfloat162_raw*>(j < 4 ? &v0 : &v1)[j % 4];
+    if (nan_flag) {
+      const uint32_t ka =
+          reinterpret_cast<const uint32_t*>(j < 4 ? &k0 : &k1)[j % 4];
+      const uint32_t va =
+          reinterpret_cast<const uint32_t*>(j < 4 ? &v0 : &v1)[j % 4];
+      // Integer tests survive fast-math assumptions about finite floats.
+      has_nan |= (ka & 0x7fff) > 0x7f80 || ((ka >> 16) & 0x7fff) > 0x7f80 ||
+                 (va & 0x7fff) > 0x7f80 || ((va >> 16) & 0x7fff) > 0x7f80;
+    }
+    float2 x = __bfloat1622float2(__ppu_bfloat162(a));
+    float2 y = __bfloat1622float2(__ppu_bfloat162(b));
+    x.x *= inv_k;
+    x.y *= inv_k;
+    y.x *= inv_v;
+    y.y *= inv_v;
+    reinterpret_cast<uint16_t*>(&pk)[j] = pack_e4m3_pair(x);
+    reinterpret_cast<uint16_t*>(&pv)[j] = pack_e4m3_pair(y);
+  }
+  reinterpret_cast<Vec16*>(ko)[vector] = pk;
+  reinterpret_cast<Vec16*>(vo)[vector] = pv;
+  if (has_nan) atomicExch(nan_flag, 1);
+}
+
+__global__ void quantize_kv(const __ppu_bfloat16_raw* k,
+                            const __ppu_bfloat16_raw* v, E4M3* ko, E4M3* vo,
+                            int rows, int heads, int64_t kt, int64_t kh,
+                            int64_t vt, int64_t vh, float inv_k, float inv_v,
+                            int* nan_flag) {
+  quantize_kv_fragment(k, v, ko, vo, rows, heads, kt, kh, vt, vh, inv_k, inv_v,
+                       nan_flag,
+                       int64_t(blockIdx.x) * blockDim.x + threadIdx.x);
+}
+
+template <int BitmapCapacity>
+__global__ void preprocess_joint(
+    const __ppu_bfloat16_raw* k, const __ppu_bfloat16_raw* v, E4M3* ko, E4M3* vo,
+    int rows, int heads, int64_t kt, int64_t kh, int64_t vt, int64_t vh,
+    float inv_k, float inv_v, int* nan_flag, const int* regions,
+    const int64_t* positions, int* info, reuse::PackedWord* packed, int q_len,
+    int width, int64_t rq, int64_t rh, int query_groups) {
+  const int bid = blockIdx.x;
+  if (bid < query_groups) {
+    const int group = bid;
+    reuse::prepare<BitmapCapacity>(regions, positions, info, packed, q_len,
+                                   rows, heads, width, rq, rh, group);
+  } else {
+    const int block = bid - query_groups;
+    quantize_kv_fragment(k, v, ko, vo, rows, heads, kt, kh, vt, vh, inv_k,
+                         inv_v, nan_flag,
+                         int64_t(block) * blockDim.x + threadIdx.x);
+  }
+}
+
+__global__ void check_fp8_nan(const E4M3* k, const E4M3* v, int rows, int heads,
+                              int64_t kt, int64_t kh, int64_t vt, int64_t vh,
+                              int* flag) {
+  const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= int64_t(rows) * heads * (Dim / 16)) return;
+  const int d = i % (Dim / 16) * 16;
+  const int h = (i / (Dim / 16)) % heads;
+  const int t = i / (Dim / 16) / heads;
+  const auto a =
+      *reinterpret_cast<const Vec16*>(k + int64_t(t) * kt + h * kh + d);
+  const auto b =
+      *reinterpret_cast<const Vec16*>(v + int64_t(t) * vt + h * vh + d);
+  bool bad = false;
+  DSA_FP8_UNROLL
+  for (int j = 0; j < 4; ++j) {
+    const uint32_t x = (a.words[j] & 0x7f7f7f7f) ^ 0x7f7f7f7f;
+    const uint32_t y = (b.words[j] & 0x7f7f7f7f) ^ 0x7f7f7f7f;
+    bad |= ((x - 0x01010101) & ~x & 0x80808080) != 0 ||
+           ((y - 0x01010101) & ~y & 0x80808080) != 0;
+  }
+  if (bad) atomicExch(flag, 1);
+}
+
+// Q's staging storage is reclaimed by the first K stage after register loading.
+constexpr int QBytes = Heads * Dim, KVBytes = Keys * Dim, PBytes = Heads * Keys;
+template <int Stages>
+constexpr int SharedBytes =
+    2 * Stages * KVBytes + PBytes + (Stages == 1 ? QBytes : 0) +
+    Stages * Keys * sizeof(int) + 10 * Heads * sizeof(float);
+template <int RegionBlock, bool QueryBF16, bool Split, bool KVBF16, int Stages>
+__global__ __launch_bounds__(Threads) void prefill(
+    const void* query, const E4M3* key, const E4M3* value, const int* regions,
+    const int64_t* positions, __ppu_bfloat16* out, int kv_heads, int groups,
+    int region_k, int kv_len, int64_t qt, int64_t qh, int64_t kt, int64_t kh,
+    int64_t vt, int64_t vh, int64_t rt, int64_t rh, float inv_q,
+    float scale_log2, float v_scale, float* partial, float* partial_lse,
+    int splits, float inv_k, float inv_v, const int* reuse_info, int q_len,
+    const int* reuse_nan_flag = nullptr) {
+  extern __shared__ __align__(128) char storage[];
+  E4M3* sk = reinterpret_cast<E4M3*>(storage);
+  E4M3 *sv = sk + Stages * KVBytes, *sp = sv + Stages * KVBytes;
+  E4M3* sq = sk;
+  int* ids = reinterpret_cast<int*>(sp + PBytes + (Stages == 1 ? QBytes : 0));
+  float* f = reinterpret_cast<float*>(ids + Stages * Keys);
+  float *pmax = f, *psum = f + 4 * Heads, *rmax = f + 8 * Heads;
+  float* rsum = rmax + Heads;
+  const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32, mi = lane / 4;
+  const bool reuse_enabled = reuse_info && !DSA_FP8_UNIF(*reuse_nan_flag);
+  const bool head_major = gridDim.z > 1;
+  const int head = head_major ? int(blockIdx.z) : int(blockIdx.x) % kv_heads;
+  const bool grouped = reuse_info && !Split && q_len >= 1024;
+  const int task = head_major ? int(blockIdx.x) : int(blockIdx.x) / kv_heads;
+  const int token0 = grouped ? task * 8 : task;
+  if (grouped && reuse_enabled) {
+    bool selected = true;
+    DSA_FP8_UNROLL
+    for (int q = 0; q < 8; q += reuse::Q) {
+      if (token0 + q < q_len)
+        selected &=
+            (DSA_FP8_UNIF(
+                 reuse_info[(((token0 + q) / reuse::Q) * kv_heads + head) *
+                            3]) &
+             1) != 0;
+    }
+    if (selected) return;
+  }
+  __shared__ int grouped_live_tiles[512], grouped_warp_counts[4];
+  int* const live_tiles_base = grouped_live_tiles;
+  int* const warp_counts_base = grouped_warp_counts;
+  // Each invocation uses a fresh closure copy so pointer updates for one
+  // query cannot affect the following query. Arithmetic stays in its
+  // original128-thread order; the outer barrier releases shared scratch.
+  auto process_query = [=](int token) mutable {
+    int* live_tiles = live_tiles_base;
+    int* warp_counts = warp_counts_base;
+    if (reuse_enabled &&
+        (DSA_FP8_UNIF(reuse_info[((token / reuse::Q) * kv_heads + head) * 3]) &
+         1))
+      return;
+    const int total_tiles = (region_k * RegionBlock + Keys - 1) / Keys;
+    const int first_tile = total_tiles * int(blockIdx.y) / splits;
+    const int partition_tiles =
+        total_tiles * (int(blockIdx.y) + 1) / splits - first_tile;
+    const int64_t partition = int64_t(blockIdx.x) * splits + blockIdx.y;
+    if constexpr (Split) {
+      partial += partition * groups * Dim;
+      partial_lse += partition * groups;
+    }
+    const int64_t horizon = min(positions[token], int64_t(kv_len) - 1);
+    regions += int64_t(token) * rt + head * rh;
+    // Compact nonempty tiles before any K/V staging or MMA. This preserves
+    // original region order and duplicates, including graph-mutated metadata.
+    const bool all_live =
+        reuse_info &&
+        ((DSA_FP8_UNIF(
+              reuse_info[2 + ((token / reuse::Q) * kv_heads + head) * 3]) >>
+          (token % reuse::Q)) &
+         1);
+    int tiles = partition_tiles;
+    if (!all_live) {
+      tiles = 0;
+      for (int begin = 0; begin < partition_tiles; begin += Threads) {
+        const int candidate = begin + tid;
+        bool live = false;
+        if (candidate < partition_tiles) {
+          DSA_FP8_UNROLL
+          for (int i = 0; i < Keys / RegionBlock; ++i) {
+            const int slot =
+                (candidate + first_tile) * (Keys / RegionBlock) + i;
+            const int region = slot < region_k ? regions[slot] : -1;
+            live |= region >= 0 && int64_t(region) * RegionBlock <= horizon;
+          }
+        }
+        const unsigned ballot = __ballot_sync(0xffffffffu, live);
+        if (lane == 0) warp_counts[warp] = __popc(ballot);
+        __syncthreads();
+        int rank = tiles + __popc(ballot & ((1u << lane) - 1));
+        DSA_FP8_UNROLL
+        for (int w = 0; w < 4; ++w) {
+          if (w < warp) rank += warp_counts[w];
+        }
+        if (live) live_tiles[rank] = candidate + first_tile;
+        tiles += (warp_counts[0] + warp_counts[1]) +
+                 (warp_counts[2] + warp_counts[3]);
+        __syncthreads();
+      }
+    }
+    tiles = DSA_FP8_UNIF(tiles);
+    out += int64_t(token) * kv_heads * groups * Dim + head * groups * Dim;
+    uint32_t rq[Dim / 32][4], rk[4], rp[4], rv[Dim / 64][4];
+    Fragment<24> output;
+    clear(output);
+    float running_max0 = NEG_INF, running_max1 = NEG_INF;
+    float normalizer0 = 0.f, normalizer1 = 0.f;
+    for (int i = tid; i < Heads * (Dim / 16); i += Threads) {
+      const int r = i / (Dim / 16), col = i % (Dim / 16) * 16;
+      Vec16 packed{};
+      if (r < groups) {
+        const int64_t offset =
+            int64_t(token) * qt + (head * groups + r) * qh + col;
+        if constexpr (QueryBF16) {
+          auto* dst = reinterpret_cast<uint16_t*>(&packed);
+          auto* src = static_cast<const __ppu_bfloat16_raw*>(query) + offset;
+          DSA_FP8_UNROLL
+          for (int j = 0; j < 8; ++j) {
+            auto raw =
+                *reinterpret_cast<const __ppu_bfloat162_raw*>(src + 2 * j);
+            float2 x = __bfloat1622float2(__ppu_bfloat162(raw));
+            x.x *= inv_q;
+            x.y *= inv_q;
+            dst[j] = pack_e4m3_pair(x);
+          }
+        } else {
+          packed = *reinterpret_cast<const Vec16*>(
+              static_cast<const E4M3*>(query) + offset);
+        }
+      }
+      *reinterpret_cast<Vec16*>(&sq[swizzle<Heads>(r, col)]) = packed;
+    }
+    __syncthreads();
+    const int qaddr = DSA_FP8_UNIF(int(reinterpret_cast<uintptr_t>(sq) / 16));
+    const int kaddr =
+        DSA_FP8_UNIF(int(reinterpret_cast<uintptr_t>(sk) / 16) + warp * 64);
+    const int paddr = DSA_FP8_UNIF(int(reinterpret_cast<uintptr_t>(sp) / 16));
+    const int vrow = (lane & 3) * 4 + ((lane >> 2) & 3);
+    const int vcol = warp * 16 + (lane >> 4) * 4;
+    const int voff =
+        int(reinterpret_cast<uint8_t*>(&sv[swizzle<Keys>(vrow, vcol)]) -
+            reinterpret_cast<uint8_t*>(sv));
+    // Q is invariant across all key tiles. Retaining its six fragments avoids
+    // repeated TSM traffic and releases the staging bytes before K arrives.
+    DSA_FP8_UNROLL
+    for (int step = 0; step < Dim / 32; ++step) {
+      DSA_FP8_LDM(rq[step], qaddr + (step / 2) * (Heads * 4) + (step % 2) * 2,
+                  1, 32);
+    }
+    __syncthreads();
+    // Cooperative gather width is independent of the MMA warp layout.
+    auto gather = [&](int tile) {
+      const int stage = tile % Stages;
+      DSA_FP8_UNROLL
+      for (int round = 0; round < Keys / (Threads / GatherLanes); ++round) {
+        const int row = tid / GatherLanes + round * (Threads / GatherLanes);
+        const int col = (tid % GatherLanes) * 16;
+        const int slot =
+            (all_live ? tile + first_tile : DSA_FP8_UNIF(live_tiles[tile])) *
+                Keys +
+            row;
+        const int region =
+            slot / RegionBlock < region_k ? regions[slot / RegionBlock] : -1;
+        const int64_t absolute =
+            int64_t(region) * RegionBlock + slot % RegionBlock;
+        const bool valid = region >= 0 && absolute >= 0 && absolute <= horizon;
+        const int safe = valid ? int(absolute) : 0;
+        if (tid % GatherLanes == 0) ids[stage * Keys + row] = valid ? safe : -1;
+        const auto* ksrc = key + int64_t(safe) * kt + head * kh + col;
+        const auto* vsrc = value + int64_t(safe) * vt + head * vh + col;
+        DSA_FP8_UNROLL
+        for (int slab = 0;
+             slab < (Dim + GatherLanes * 16 - 1) / (GatherLanes * 16); ++slab) {
+          if (col + slab * GatherLanes * 16 < Dim) {
+            auto* kd = &sk[swizzle<Keys>(row, col + slab * GatherLanes * 16)] +
+                       stage * KVBytes;
+            auto* vd = &sv[swizzle<Keys>(row, col + slab * GatherLanes * 16)] +
+                       stage * KVBytes;
+            if constexpr (KVBF16) {
+              Vec16 pk{}, pv{};
+              if (valid) {
+                const auto* ki =
+                    reinterpret_cast<const __ppu_bfloat16_raw*>(key) +
+                    int64_t(safe) * kt + head * kh + col +
+                    slab * GatherLanes * 16;
+                const auto* vi =
+                    reinterpret_cast<const __ppu_bfloat16_raw*>(value) +
+                    int64_t(safe) * vt + head * vh + col +
+                    slab * GatherLanes * 16;
+                const auto k0 = *reinterpret_cast<const Vec16*>(ki);
+                const auto k1 = *reinterpret_cast<const Vec16*>(ki + 8);
+                const auto v0 = *reinterpret_cast<const Vec16*>(vi);
+                const auto v1 = *reinterpret_cast<const Vec16*>(vi + 8);
+                DSA_FP8_UNROLL
+                for (int j = 0; j < 8; ++j) {
+                  auto a = reinterpret_cast<const __ppu_bfloat162_raw*>(
+                      j < 4 ? &k0 : &k1)[j % 4];
+                  auto b = reinterpret_cast<const __ppu_bfloat162_raw*>(
+                      j < 4 ? &v0 : &v1)[j % 4];
+                  float2 x = __bfloat1622float2(__ppu_bfloat162(a));
+                  float2 y = __bfloat1622float2(__ppu_bfloat162(b));
+                  x.x *= inv_k;
+                  x.y *= inv_k;
+                  y.x *= inv_v;
+                  y.y *= inv_v;
+                  reinterpret_cast<uint16_t*>(&pk)[j] = pack_e4m3_pair(x);
+                  reinterpret_cast<uint16_t*>(&pv)[j] = pack_e4m3_pair(y);
+                }
+              }
+              *reinterpret_cast<Vec16*>(kd) = pk;
+              *reinterpret_cast<Vec16*>(vd) = pv;
+            } else {
+              copy_async_16(ksrc + slab * GatherLanes * 16, kd, valid);
+              copy_async_16(vsrc + slab * GatherLanes * 16, vd, valid);
+            }
+          }
+        }
+      }
+    };
+    if (tiles > 0) prime_kv_pipeline(gather);
+    for (int tile = 0; tile < tiles; ++tile) {
+      if constexpr (Stages > 1) prefetch_next_kv(gather, tile, tiles);
+      Fragment<8> score;
+      Fragment<8> score1;
+      clear(score);
+      clear(score1);
+      DSA_FP8_UNROLL
+      for (int step = 0; step < Dim / 32; ++step) {
+        DSA_FP8_LDM(rk,
+                    kaddr + (tile % Stages) * (KVBytes / 16) +
+                        (step / 2) * (Keys * 4) + (step % 2) * 2,
+                    32, 1);
+        if (step % 2 == 0)
+          gemm(rq[step], rk, score);
+        else
+          gemm(rq[step], rk, score1);
+      }
+      DSA_FP8_UNROLL
+      for (int e = 0; e < 8; ++e) {
+        const int col =
+            warp * 16 + (lane % 4) * 2 + ((e >> 2) & 1) * 8 + (e & 1);
+        float sum = score(e) + score1(e);
+        score(e) = ids[(tile % Stages) * Keys + col] >= 0 ? sum : -INFINITY;
+      }
+      reduce_score_max<Heads>(score, pmax, lane, warp, mi);
+      __syncthreads();
+      const float tile0 =
+          fmaxf(fmaxf(pmax[mi], pmax[Heads + mi]),
+                fmaxf(pmax[2 * Heads + mi], pmax[3 * Heads + mi])) *
+          scale_log2;
+      const float tile1 =
+          fmaxf(fmaxf(pmax[mi + 8], pmax[Heads + mi + 8]),
+                fmaxf(pmax[2 * Heads + mi + 8], pmax[3 * Heads + mi + 8])) *
+          scale_log2;
+      const float next0 = fmaxf(running_max0, ceilf(tile0));
+      const float next1 = fmaxf(running_max1, ceilf(tile1));
+      const float alpha0 =
+          running_max0 == NEG_INF ? 1.f : exp2f(running_max0 - next0);
+      const float alpha1 =
+          running_max1 == NEG_INF ? 1.f : exp2f(running_max1 - next1);
+      running_max0 = next0;
+      running_max1 = next1;
+      float sums[2] = {0.f, 0.f};
+      auto store_pair = [&](int e, uint16_t packed) {
+        *reinterpret_cast<uint16_t*>(
+            &sp[swizzle<Heads>(mi + score_row(e), score_col(e, lane, warp))]) =
+            packed;
+      };
+      quantize_probability(score, sums, running_max0, running_max1, scale_log2,
+                           store_pair);
+      DSA_FP8_UNROLL
+      for (int delta = 1; delta <= 2; delta *= 2) {
+        sums[0] += __shfl_xor_sync(0xffffffff, sums[0], delta);
+        sums[1] += __shfl_xor_sync(0xffffffff, sums[1], delta);
+      }
+      normalizer0 = normalizer0 * alpha0 + sums[0];
+      normalizer1 = normalizer1 * alpha1 + sums[1];
+      if (alpha0 != 1.f || alpha1 != 1.f) {
+        output_scale(output, alpha0, alpha1);
+      }
+      __syncthreads();
+      // Adapt the verified FlashMLA V transpose mapping to DV=192/4 warps.
+      DSA_FP8_UNROLL
+      for (int step = 0; step < Keys / 32; ++step) {
+        DSA_FP8_UNROLL
+        for (int n = 0; n < Dim / 64; ++n) {
+          const auto* base = reinterpret_cast<const uint8_t*>(sv) +
+                             (tile % Stages) * KVBytes + n * (64 * Keys) +
+                             step * (4 * 512) + voff;
+          auto* frag = rv[n];
+          frag[0] = mat_trans_b8(*reinterpret_cast<const uint32_t*>(base));
+          frag[1] =
+              mat_trans_b8(*reinterpret_cast<const uint32_t*>(base + 1024));
+          frag[2] = mat_trans_b8(*reinterpret_cast<const uint32_t*>(base + 8));
+          frag[3] =
+              mat_trans_b8(*reinterpret_cast<const uint32_t*>(base + 1032));
+        }
+        DSA_FP8_LDM(rp, paddr + step * 2, 1, 32);
+        DSA_FP8_UNROLL
+        for (int n = 0; n < Dim / 64; ++n) output_mma(rp, rv[n], output, n);
+      }
+      if constexpr (Stages == 1) {
+        if (tile + 1 < tiles) {
+          __syncthreads();
+          gather(tile + 1);
+          commit_async();
+          wait_async();
+          __syncthreads();
+        }
+      } else {
+        wait_next_kv(tile, tiles);
+      }
+    }
+    if ((lane & 3) == 0) {
+      psum[warp * Heads + mi] = normalizer0;
+      psum[warp * Heads + mi + 8] = normalizer1;
+      if (warp == 0) {
+        rmax[mi] = running_max0;
+        rmax[mi + 8] = running_max1;
+      }
+    }
+    __syncthreads();
+    if (tid < Heads)
+      rsum[tid] = (psum[tid] + psum[Heads + tid]) +
+                  (psum[2 * Heads + tid] + psum[3 * Heads + tid]);
+    __syncthreads();
+    if constexpr (Split) {
+      if (tid < groups)
+        partial_lse[tid] = rsum[tid] > 0.f
+                               ? rmax[tid] + log2f(rsum[tid] * INV_P_SCALE)
+                               : -INFINITY;
+    }
+    DSA_FP8_UNROLL
+    for (int e = 0; e < size(output); e += 2) {
+      const int row = score_row(e) + mi;
+      const int col = output_col(e, lane, warp);
+      if (row < groups) {
+        const float factor = rsum[row] > 0.f ? v_scale / rsum[row] : 0.f;
+        if constexpr (Split) {
+          partial[row * Dim + col] = output(e) * factor;
+          partial[row * Dim + col + 1] = output(e + 1) * factor;
+        } else {
+          const __ppu_bfloat16 a = __float2bfloat16_rn(output(e) * factor);
+          const __ppu_bfloat16 b = __float2bfloat16_rn(output(e + 1) * factor);
+          *reinterpret_cast<uint32_t*>(&out[row * Dim + col]) =
+              uint32_t(reinterpret_cast<const uint16_t&>(a)) |
+              (uint32_t(reinterpret_cast<const uint16_t&>(b)) << 16);
+        }
+      }
+    }
+  };
+  const int queries = grouped ? 8 : 1;
+#pragma unroll 1
+  for (int q = 0; q < queries; ++q) {
+    if (token0 + q < q_len) {
+      auto one_query = process_query;
+      one_query(token0 + q);
+    }
+    __syncthreads();
+  }
+}
+
+__global__ void merge_partitions(const float* part, const float* lse,
+                                 __ppu_bfloat16* out, int groups, int splits) {
+  const int task = blockIdx.x / groups, head = blockIdx.x % groups,
+            tid = threadIdx.x;
+  __shared__ float weights[32];
+  __shared__ float inv_sum;
+  if (tid < 32) {
+    const float x = tid < splits
+                        ? lse[(int64_t(task) * splits + tid) * groups + head]
+                        : -INFINITY;
+    float maximum = x;
+    for (int step = 16; step; step /= 2)
+      maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, step));
+    float w = maximum > -INFINITY && tid < splits ? exp2f(x - maximum) : 0.f;
+    if (tid < splits) weights[tid] = w;
+    for (int step = 16; step; step /= 2)
+      w += __shfl_xor_sync(0xffffffff, w, step);
+    if (tid == 0) inv_sum = w > 0.f ? 1.f / w : 0.f;
+  }
+  __syncthreads();
+  for (int d = tid; d < Dim; d += blockDim.x) {
+    float result = 0.f;
+    for (int s = 0; s < splits; ++s)
+      result =
+          fmaf(weights[s],
+               part[((int64_t(task) * splits + s) * groups + head) * Dim + d],
+               result);
+    out[(int64_t(task) * groups + head) * Dim + d] =
+        __float2bfloat16_rn(result * inv_sum);
+  }
+}
+
+at::Tensor forward(const at::Tensor& q, const at::Tensor& k,
+                   const at::Tensor& v, const at::Tensor& regions,
+                   const at::Tensor& positions, int64_t block, int64_t kv_len,
+                   double scale, double q_scale, double k_scale, double v_scale,
+                   const std::optional<at::Tensor>& out) {
+  step5_dsa::check_devices(q, {k, v, regions, positions});
+  const c10::cuda::CUDAGuard guard(q.device());
+  const auto* props = at::cuda::getCurrentDeviceProperties();
+  TORCH_CHECK(props->major == 8 && props->minor == 9,
+              "sparse GQA FP8 requires PPU0015/ZW-M890P");
+  for (const auto& t : {q, k, v, regions, positions}) {
+    for (auto s : t.sizes())
+      TORCH_CHECK(s <= INT_MAX, "sparse GQA FP8: shape too large");
+  }
+  TORCH_CHECK(q.dim() == 3 && k.dim() == 3 && v.sizes() == k.sizes() &&
+                  q.size(2) == Dim && k.size(2) == Dim,
+              "sparse GQA FP8 expects D192 Q/K/V");
+  TORCH_CHECK(k.size(1) > 0 &&
+                  (q.size(1) == 8 * k.size(1) || q.size(1) == 16 * k.size(1)),
+              "sparse GQA FP8 expects GQA8 or GQA16");
+  TORCH_CHECK(
+      q.scalar_type() == at::kBFloat16 || q.scalar_type() == at::kFloat8_e4m3fn,
+      "sparse GQA FP8: Q must be BF16 or E4M3");
+  TORCH_CHECK(k.scalar_type() == v.scalar_type() &&
+                  (k.scalar_type() == at::kBFloat16 ||
+                   k.scalar_type() == at::kFloat8_e4m3fn),
+              "sparse GQA FP8: K/V must both be BF16 or both E4M3");
+  TORCH_CHECK(regions.dim() == 3 && regions.size(0) == q.size(0) &&
+                  regions.size(1) == k.size(1) && regions.size(2) <= 1024 &&
+                  regions.scalar_type() == at::kInt && regions.stride(2) == 1,
+              "sparse GQA FP8: regions must be [Q,KV_heads,<=1024] int32 with "
+              "dense slots");
+  TORCH_CHECK(positions.dim() == 1 && positions.numel() == q.size(0) &&
+                  positions.scalar_type() == at::kLong &&
+                  positions.is_contiguous(),
+              "sparse GQA FP8: positions must be contiguous [Q] int64");
+  TORCH_CHECK(block == 4 || block == 8 || block == 16 || block == 32,
+              "sparse GQA FP8: region block must be 4, 8, 16 or 32");
+  TORCH_CHECK(kv_len >= 0 && kv_len <= k.size(0),
+              "sparse GQA FP8: invalid KV extent");
+  for (double x :
+       {scale, q_scale, k_scale, v_scale, 1.0 / q_scale, 1.0 / k_scale,
+        1.0 / v_scale, scale * q_scale * k_scale * 1.4426950408889634})
+    TORCH_CHECK(std::isfinite(x) && x >= std::numeric_limits<float>::min() &&
+                    x <= std::numeric_limits<float>::max(),
+                "sparse GQA FP8: invalid scalar scale");
+  for (const auto& t : {q, k, v})
+    TORCH_CHECK(t.stride(2) == 1 && t.stride(0) % 16 == 0 &&
+                    t.stride(1) % 16 == 0 &&
+                    reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0,
+                "sparse GQA FP8: Q/K/V rows must be dense and 16-byte aligned");
+  auto output = out.has_value()
+                    ? *out
+                    : at::empty(q.sizes(), q.options().dtype(at::kBFloat16));
+  TORCH_CHECK(output.device() == q.device() &&
+                  output.scalar_type() == at::kBFloat16 &&
+                  output.sizes() == q.sizes() && output.is_contiguous() &&
+                  reinterpret_cast<uintptr_t>(output.data_ptr()) % 4 == 0,
+              "sparse GQA FP8: output must be contiguous BF16 matching Q");
+  step5_dsa::check_output(output, {q, k, v, regions, positions});
+  if (q.size(0) == 0 || kv_len == 0 || regions.size(2) == 0) {
+    output.zero_();
+    return output;
+  }
+  step5_dsa::check_int32(
+      {q.size(0) * k.size(1), kv_len * k.size(1) * (Dim / 16)});
+  const auto stream = get_current_cuda_stream(q.get_device());
+  const int tasks = q.size(0) * k.size(1);
+  const bool try_reuse = block == 8 && kv_len <= 65536 &&
+                         regions.size(2) <= 513 && q.size(0) >= 128;
+  // Sharing V is unsafe for masked NaNs: 0*NaN must not contaminate another
+  // query. Inspect once during conversion, then select the original consumer
+  // on device. Graph replay resets this flag for every new input.
+  at::Tensor nan_flag;
+  int* nan_pointer = nullptr;
+  if (try_reuse) {
+    nan_flag = at::zeros({1}, regions.options());
+    nan_pointer = nan_flag.data_ptr<int>();
+  }
+  const bool fused_kv = k.scalar_type() == at::kBFloat16 && tasks <= 8;
+  // Independent CTA types may overlap within one launch. Both finish before
+  // the consumers read the NaN flag or packed K/V.
+  const bool joint_preprocess = try_reuse && k.scalar_type() == at::kBFloat16 &&
+                                !fused_kv &&
+                                tasks >= props->multiProcessorCount;
+  at::Tensor packed;
+  auto kp = reinterpret_cast<const E4M3*>(k.data_ptr());
+  auto vp = reinterpret_cast<const E4M3*>(v.data_ptr());
+  int64_t kt = k.stride(0), kh = k.stride(1), vt = v.stride(0),
+          vh = v.stride(1);
+  if (k.scalar_type() == at::kBFloat16 && !fused_kv) {
+    packed = at::empty({2, kv_len, k.size(1), Dim},
+                       k.options().dtype(at::kFloat8_e4m3fn));
+    auto* p = reinterpret_cast<E4M3*>(packed.data_ptr());
+    if (!joint_preprocess)
+      quantize_kv<<<(kv_len * k.size(1) * (Dim / 16) + 255) / 256, 256, 0,
+                    stream>>>(
+          reinterpret_cast<const __ppu_bfloat16_raw*>(k.data_ptr()),
+          reinterpret_cast<const __ppu_bfloat16_raw*>(v.data_ptr()), p,
+          p + kv_len * k.size(1) * Dim, kv_len, k.size(1), kt, kh, vt, vh,
+          float(1.0 / k_scale), float(1.0 / v_scale), nan_pointer);
+    kp = p;
+    vp = p + kv_len * k.size(1) * Dim;
+    kt = vt = k.size(1) * Dim;
+    kh = vh = Dim;
+  }
+  if (try_reuse && k.scalar_type() == at::kFloat8_e4m3fn)
+    check_fp8_nan<<<(kv_len * k.size(1) * (Dim / 16) + 255) / 256, 256, 0,
+                    stream>>>(kp, vp, kv_len, k.size(1), kt, kh, vt, vh,
+                              nan_pointer);
+  const int tiles = (regions.size(2) * block + Keys - 1) / Keys;
+  int splits = 1;
+  while (tasks < props->multiProcessorCount && splits < 32 &&
+         splits * 2 <= tiles / 2 &&
+         tasks * splits < 2 * props->multiProcessorCount)
+    splits *= 2;
+  at::Tensor partial, partial_lse;
+  if (splits > 1) {
+    partial = at::empty({tasks, splits, q.size(1) / k.size(1), Dim},
+                        q.options().dtype(at::kFloat));
+    partial_lse = at::empty({tasks, splits, q.size(1) / k.size(1)},
+                            q.options().dtype(at::kFloat));
+  }
+  const bool single_stage =
+      (k.size(1) == 1 && tasks >= 8 * props->multiProcessorCount) ||
+      q.size(0) >= 512;
+  // Finish many queries for one KV head before changing heads, keeping that
+  // head's sparse working set in LLC. Split grids retain their original map.
+  const bool head_major =
+      q.size(0) >= 512 && k.size(1) > 1 && k.size(1) <= 65535;
+  const dim3 grid =
+      head_major ? dim3(q.size(0), 1, k.size(1)) : dim3(tasks, splits);
+  at::Tensor reuse_info, reuse_regions;
+  const int* reuse_flags = nullptr;
+  if (try_reuse && splits == 1) {
+    const int query_groups = (q.size(0) + reuse::Q - 1) / reuse::Q * k.size(1);
+    const int reuse_grid = query_groups;
+    reuse_info = at::empty({3 * query_groups}, regions.options());
+    reuse_regions =
+        at::empty({query_groups, reuse::packed_capacity(regions.size(2))},
+                  regions.options());
+    auto launch_prepare = [&](auto capacity) {
+      if (joint_preprocess) {
+        const int quant_blocks =
+            (kv_len * k.size(1) * (Dim / 16) + 128 - 1) / 128;
+        auto* p = reinterpret_cast<E4M3*>(packed.data_ptr());
+        preprocess_joint<decltype(capacity)::value>
+            <<<query_groups + quant_blocks, 128, 0, stream>>>(
+                reinterpret_cast<const __ppu_bfloat16_raw*>(k.data_ptr()),
+                reinterpret_cast<const __ppu_bfloat16_raw*>(v.data_ptr()), p,
+                p + kv_len * k.size(1) * Dim, kv_len, k.size(1), k.stride(0),
+                k.stride(1), v.stride(0), v.stride(1), float(1.0 / k_scale),
+                float(1.0 / v_scale), nan_pointer, regions.data_ptr<int>(),
+                positions.data_ptr<int64_t>(), reuse_info.data_ptr<int>(),
+                reuse_regions.data_ptr<reuse::PackedWord>(), q.size(0),
+                regions.size(2), regions.stride(0), regions.stride(1),
+                query_groups);
+      } else {
+        reuse::prepare_standalone<decltype(capacity)::value>
+            <<<query_groups, 128, 0, stream>>>(
+                regions.data_ptr<int>(), positions.data_ptr<int64_t>(),
+                reuse_info.data_ptr<int>(),
+                reuse_regions.data_ptr<reuse::PackedWord>(), q.size(0), kv_len,
+                k.size(1), regions.size(2), regions.stride(0),
+                regions.stride(1));
+      }
+    };
+    if (kv_len <= 8192)
+      launch_prepare(std::integral_constant<int, 32>{});
+    else if (kv_len <= 16384)
+      launch_prepare(std::integral_constant<int, 64>{});
+    else if (kv_len <= 32768)
+      launch_prepare(std::integral_constant<int, 128>{});
+    else
+      launch_prepare(std::integral_constant<int, 256>{});
+    reuse_flags = reuse_info.data_ptr<int>();
+#define LAUNCH_REUSE(BF)                                                      \
+  do {                                                                        \
+    TORCH_CHECK(                                                              \
+        hggcFuncSetAttribute(reuse::prefill_mixed<BF>,                        \
+                             hggcFuncAttributeMaxDynamicSharedMemorySize,     \
+                             reuse::SharedBytes) == hggcSuccess,              \
+        "sparse GQA FP8: reuse shared memory failed");                        \
+    reuse::prefill_mixed<BF>                                                  \
+        <<<reuse_grid, reuse::ConsumerThreads, reuse::SharedBytes, stream>>>( \
+            q.data_ptr(), kp, vp, reuse_flags,                                \
+            reuse_regions.data_ptr<reuse::PackedWord>(),                      \
+            positions.data_ptr<int64_t>(),                                    \
+            reinterpret_cast<__ppu_bfloat16*>(output.data_ptr()), q.size(0),   \
+            kv_len, k.size(1), q.size(1) / k.size(1), regions.size(2),        \
+            q.stride(0), q.stride(1), kt, kh, vt, vh, float(1.0 / q_scale),   \
+            float(scale * q_scale * k_scale * 1.4426950408889634),            \
+            float(v_scale), nan_pointer);                                     \
+  } while (0)
+    if (q.scalar_type() == at::kBFloat16) {
+      LAUNCH_REUSE(true);
+    } else {
+      LAUNCH_REUSE(false);
+    }
+#undef LAUNCH_REUSE
+  }
+  dim3 fallback_grid = grid;
+  if (reuse_flags && splits == 1 && q.size(0) >= 1024)
+    fallback_grid.x = (q.size(0) + 8 - 1) / 8 * (grid.z > 1 ? 1 : k.size(1));
+#define LAUNCH(B, BF, SPLIT, KVBF, STAGES)                                     \
+  do {                                                                         \
+    TORCH_CHECK(                                                               \
+        hggcFuncSetAttribute(prefill<B, BF, SPLIT, KVBF, STAGES>,              \
+                             hggcFuncAttributeMaxDynamicSharedMemorySize,      \
+                             SharedBytes<STAGES>) == hggcSuccess,              \
+        "sparse GQA FP8: shared memory configuration failed");                 \
+    prefill<B, BF, SPLIT, KVBF, STAGES>                                        \
+        <<<fallback_grid, Threads, SharedBytes<STAGES>, stream>>>(             \
+            q.data_ptr(), kp, vp, regions.data_ptr<int>(),                     \
+            positions.data_ptr<int64_t>(),                                     \
+            reinterpret_cast<__ppu_bfloat16*>(output.data_ptr()), k.size(1),    \
+            q.size(1) / k.size(1), regions.size(2), kv_len, q.stride(0),       \
+            q.stride(1), kt, kh, vt, vh, regions.stride(0), regions.stride(1), \
+            float(1.0 / q_scale),                                              \
+            float(scale * q_scale * k_scale * 1.4426950408889634),             \
+            float(v_scale), splits > 1 ? partial.data_ptr<float>() : nullptr,  \
+            splits > 1 ? partial_lse.data_ptr<float>() : nullptr, splits,      \
+            float(1.0 / k_scale), float(1.0 / v_scale), reuse_flags,           \
+            q.size(0), nan_pointer);                                           \
+  } while (0)
+#define SCHEDULE(B, BF, SPLIT, KVBF)   \
+  do {                                 \
+    if constexpr (!SPLIT && !KVBF) {   \
+      if (single_stage) {              \
+        LAUNCH(B, BF, SPLIT, KVBF, 1); \
+      } else {                         \
+        LAUNCH(B, BF, SPLIT, KVBF, 2); \
+      }                                \
+    } else {                           \
+      LAUNCH(B, BF, SPLIT, KVBF, 2);   \
+    }                                  \
+  } while (0)
+#define QUERY(B, SPLIT, KVBF)               \
+  do {                                      \
+    if (q.scalar_type() == at::kBFloat16) { \
+      SCHEDULE(B, true, SPLIT, KVBF);       \
+    } else {                                \
+      SCHEDULE(B, false, SPLIT, KVBF);      \
+    }                                       \
+  } while (0)
+#define STORAGE(B, SPLIT)     \
+  do {                        \
+    if (fused_kv) {           \
+      QUERY(B, SPLIT, true);  \
+    } else {                  \
+      QUERY(B, SPLIT, false); \
+    }                         \
+  } while (0)
+#define DISPATCH(B)      \
+  do {                   \
+    if (splits > 1) {    \
+      STORAGE(B, true);  \
+    } else {             \
+      STORAGE(B, false); \
+    }                    \
+  } while (0)
+  switch (block) {
+    case 4:
+      DISPATCH(4);
+      break;
+    case 8:
+      DISPATCH(8);
+      break;
+    case 16:
+      DISPATCH(16);
+      break;
+    case 32:
+      DISPATCH(32);
+      break;
+  }
+#undef DISPATCH
+#undef STORAGE
+#undef QUERY
+#undef SCHEDULE
+#undef LAUNCH
+  if (splits > 1)
+    merge_partitions<<<q.size(0) * q.size(1), 128, 0, stream>>>(
+        partial.data_ptr<float>(), partial_lse.data_ptr<float>(),
+        reinterpret_cast<__ppu_bfloat16*>(output.data_ptr()),
+        q.size(1) / k.size(1), splits);
+  step5_runtime::check(hggcGetLastError());
+  return output;
+}
+}  // namespace step5_dsa_fp8
+
+TORCH_LIBRARY_FRAGMENT(_ppu_C, m) {
+  m.def(
+      "step5_dsa_fp8_prefill(Tensor q, Tensor k, Tensor v, Tensor regions, Tensor positions, "
+      "int region_block_size, int kv_seq_len, float softmax_scale, float "
+      "q_scale, "
+      "float k_scale, float v_scale, Tensor(a!)? out=None"
+      ") -> Tensor(a!)");
+}
+TORCH_LIBRARY_IMPL(_ppu_C, CUDA, m) {
+  m.impl("step5_dsa_fp8_prefill", &step5_dsa_fp8::forward);
+}
